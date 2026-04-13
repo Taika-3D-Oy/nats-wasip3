@@ -1,0 +1,12 @@
+[target.wasm32-wasip3]
+runner = [
+    "~/.cargo/bin/wasmtime", "run",
+    "-S", "p3=y",
+    "-S", "inherit-network=y",
+    "-W", "component-model=y",
+    "-W", "component-model-async=y",
+]
+rustflags = ["-C", "link-args=-z stack-size=8388608"]
+
+[unstable]
+build-std = ["std", "panic_abort"]

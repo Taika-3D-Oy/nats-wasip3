@@ -1,0 +1,5 @@
+package nats:wasi;
+
+world nats-tls {
+    include wasi:tls/imports@0.3.0-draft;
+}

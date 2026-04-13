@@ -1,0 +1,46 @@
+[workspace]
+
+[package]
+name = "nats-wasip3"
+version = "0.3.0"
+edition = "2024"
+description = "NATS client for wasm32-wasip3 — native Component Model async I/O"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Taika-3D-Oy/nats-wasip3"
+keywords = ["nats", "wasi", "wasip3", "wasm", "jetstream"]
+categories = ["network-programming", "wasm"]
+
+[dependencies]
+# P3 raw bindings — native CM async sockets, clocks, streams, futures
+wasip3 = "0.5"
+wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# TLS via wasi:tls host interface — no in-wasm crypto needed
+# (feature flag kept for conditional compilation)
+
+# NKey auth (Ed25519 signing) — optional
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
+data-encoding = { version = "2", default-features = false, features = ["alloc"], optional = true }
+
+[features]
+default = ["kv"]
+tls = []
+kv = ["jetstream"]
+jetstream = []
+nkey = ["dep:ed25519-dalek", "dep:data-encoding"]
+
+[dev-dependencies]
+
+[[example]]
+name = "integration_tests"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "pubsub"
+crate-type = ["cdylib"]

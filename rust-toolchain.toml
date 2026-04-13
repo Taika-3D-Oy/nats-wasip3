@@ -1,0 +1,4 @@
+[toolchain]
+channel = "nightly"
+targets = ["wasm32-wasip3"]
+components = ["rust-src"]
