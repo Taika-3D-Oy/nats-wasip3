@@ -2,14 +2,16 @@
 
 [package]
 name = "nats-wasip3"
-version = "0.3.0"
-edition = "2024"
+version = "0.3.1"
+edition = "2021"
 description = "NATS client for wasm32-wasip3 — native Component Model async I/O"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/Taika-3D-Oy/nats-wasip3"
 keywords = ["nats", "wasi", "wasip3", "wasm", "jetstream"]
 categories = ["network-programming", "wasm"]
+authors = ["Taika 3D Oy"]
+rust-version = "1.85"
 
 [dependencies]
 # P3 raw bindings — native CM async sockets, clocks, streams, futures

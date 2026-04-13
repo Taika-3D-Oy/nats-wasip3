@@ -24,8 +24,8 @@
 //!     --env NATS_URL=127.0.0.1:14222 --env NATS_TLS_URL=127.0.0.1:4223 \
 //!     target/wasm32-wasip3/debug/examples/integration_tests.wasm
 
-use nats_wasi::client::{Client, ConnectConfig, Message, secs, millis, with_timeout};
-use nats_wasi::proto::Headers;
+use nats_wasip3::client::{Client, ConnectConfig, Message, secs, millis, with_timeout};
+use nats_wasip3::proto::Headers;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -287,7 +287,7 @@ async fn test_large_payload() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_publish() {
-    use nats_wasi::jetstream::{JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -318,7 +318,7 @@ async fn test_jetstream_publish() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_purge_stream() {
-    use nats_wasi::jetstream::{JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -352,7 +352,7 @@ async fn test_jetstream_purge_stream() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_consumer_crud() {
-    use nats_wasi::jetstream::{
+    use nats_wasip3::jetstream::{
         AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig,
     };
 
@@ -393,7 +393,7 @@ async fn test_jetstream_consumer_crud() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_stream_get_msg() {
-    use nats_wasi::jetstream::{JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -428,7 +428,7 @@ async fn test_jetstream_stream_get_msg() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_publish_with_headers() {
-    use nats_wasi::jetstream::{JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -456,7 +456,7 @@ async fn test_jetstream_publish_with_headers() {
 
 #[cfg(feature = "jetstream")]
 async fn test_push_consumer() {
-    use nats_wasi::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -523,8 +523,8 @@ async fn test_push_consumer() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_put_get() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig, Operation};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig, Operation};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -577,8 +577,8 @@ async fn test_kv_put_get() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_purge_key() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -611,8 +611,8 @@ async fn test_kv_purge_key() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_keys_and_load_all() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -653,8 +653,8 @@ async fn test_kv_keys_and_load_all() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_get_nonexistent() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -679,8 +679,8 @@ async fn test_kv_get_nonexistent() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_open_existing() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -710,8 +710,8 @@ async fn test_kv_open_existing() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_watch() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig, Operation};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig, Operation};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -776,7 +776,7 @@ async fn test_request_timeout() {
         .request("test.timeout.sink", b"waiting", millis(500))
         .await;
     assert!(
-        matches!(result, Err(nats_wasi::Error::Timeout)),
+        matches!(result, Err(nats_wasip3::Error::Timeout)),
         "expected Timeout error, got: {result:?}",
     );
 }
@@ -894,7 +894,7 @@ async fn test_publish_max_payload_boundary() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_fetch_empty_stream() {
-    use nats_wasi::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -934,7 +934,7 @@ async fn test_jetstream_fetch_empty_stream() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_publish_dedup() {
-    use nats_wasi::jetstream::{JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -984,7 +984,7 @@ async fn test_jetstream_publish_dedup() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_stream_info_not_found() {
-    use nats_wasi::jetstream::JetStream;
+    use nats_wasip3::jetstream::JetStream;
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -999,8 +999,8 @@ async fn test_jetstream_stream_info_not_found() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_update_wrong_revision() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -1022,7 +1022,7 @@ async fn test_kv_update_wrong_revision() {
     // Update with wrong revision.
     let bad = kv.update("caskey", b"v2", rev + 999).await;
     assert!(
-        matches!(bad, Err(nats_wasi::Error::RevisionMismatch)),
+        matches!(bad, Err(nats_wasip3::Error::RevisionMismatch)),
         "expected RevisionMismatch, got: {bad:?}",
     );
 
@@ -1035,8 +1035,8 @@ async fn test_kv_update_wrong_revision() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_put_overwrite() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -1064,8 +1064,8 @@ async fn test_kv_put_overwrite() {
 
 #[cfg(feature = "kv")]
 async fn test_kv_delete_then_create() {
-    use nats_wasi::jetstream::JetStream;
-    use nats_wasi::kv::{KeyValue, KvConfig};
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -1186,7 +1186,7 @@ async fn test_tls_with_headers(client: &Client) {
 
 #[cfg(all(feature = "tls", feature = "jetstream"))]
 async fn test_tls_jetstream(client: &Client) {
-    use nats_wasi::jetstream::{JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
 
     let js = JetStream::new(client.clone());
 

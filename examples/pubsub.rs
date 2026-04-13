@@ -6,7 +6,7 @@
 //! cargo build --example pubsub --target wasm32-wasip3
 //! ```
 
-use nats_wasi::client::{Client, ConnectConfig};
+use nats_wasip3::client::{Client, ConnectConfig};
 
 wasip3::cli::command::export!(PubSub);
 
@@ -19,7 +19,7 @@ impl wasip3::exports::cli::run::Guest for PubSub {
     }
 }
 
-async fn run() -> Result<(), nats_wasi::Error> {
+async fn run() -> Result<(), nats_wasip3::Error> {
     let client = Client::connect(ConnectConfig::default()).await?;
     println!("connected to {}", client.server_info().server_name);
 
