@@ -1,6 +1,7 @@
 use std::fmt;
 
 use wasip3::sockets::types::ErrorCode;
+use wasip3::sockets::ip_name_lookup::ErrorCode as DnsErrorCode;
 
 /// Errors returned by nats-wasi operations.
 #[derive(Debug)]
@@ -9,6 +10,8 @@ pub enum Error {
     Io(std::io::Error),
     /// WASI P3 socket error.
     Socket(ErrorCode),
+    /// DNS resolution error.
+    Dns(DnsErrorCode),
     /// Server returned -ERR.
     Server(String),
     /// Protocol parse error.
@@ -41,6 +44,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Socket(e) => write!(f, "socket: {e:?}"),
+            Error::Dns(e) => write!(f, "dns: {e:?}"),
             Error::Server(msg) => write!(f, "server: {msg}"),
             Error::Protocol(msg) => write!(f, "protocol: {msg}"),
             Error::Timeout => write!(f, "timeout"),
@@ -74,6 +78,12 @@ impl From<std::io::Error> for Error {
 impl From<ErrorCode> for Error {
     fn from(e: ErrorCode) -> Self {
         Error::Socket(e)
+    }
+}
+
+impl From<DnsErrorCode> for Error {
+    fn from(e: DnsErrorCode) -> Self {
+        Error::Dns(e)
     }
 }
 

@@ -1211,6 +1211,46 @@ async fn test_tls_jetstream(client: &Client) {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  DNS hostname resolution
+// ══════════════════════════════════════════════════════════════════
+
+async fn test_connect_dns_hostname() {
+    // Connect using a DNS hostname instead of a literal IP.
+    // Set NATS_DNS_URL to a resolvable hostname, e.g. "my-nats.local:14222".
+    // Falls back to "localhost:<port>" from NATS_URL.
+    let dns_addr = match std::env::var("NATS_DNS_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let addr = nats_address();
+            let port = addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("4222");
+            format!("localhost:{port}")
+        }
+    };
+
+    let result = Client::connect(ConnectConfig {
+        address: dns_addr.clone(),
+        ..Default::default()
+    })
+    .await;
+
+    match result {
+        Ok(client) => {
+            // Verify the connection works by doing a pub/sub round-trip.
+            let sub = client.subscribe("test.dns.roundtrip").unwrap();
+            client.publish("test.dns.roundtrip", b"dns-ok").unwrap();
+            let msg = sub.next().await.unwrap();
+            assert_eq!(msg.subject, "test.dns.roundtrip");
+            assert_payload(&msg, b"dns-ok");
+        }
+        Err(nats_wasip3::Error::Dns(_)) => {
+            // DNS resolution not available in this runtime — skip gracefully.
+            println!("  (skipped: DNS resolution not available for {dns_addr})");
+        }
+        Err(e) => panic!("unexpected error connecting to {dns_addr}: {e}"),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  Test runner
 // ══════════════════════════════════════════════════════════════════
 
@@ -1258,6 +1298,7 @@ async fn run_tests() {
     run_test!("test_queue_group_distribution", test_queue_group_distribution().await);
     run_test!("test_concurrent_subscriptions_same_subject", test_concurrent_subscriptions_same_subject().await);
     run_test!("test_publish_max_payload_boundary", test_publish_max_payload_boundary().await);
+    run_test!("test_connect_dns_hostname", test_connect_dns_hostname().await);
 
     // ── JetStream ──────────────────────────────────────────────
     #[cfg(feature = "jetstream")]

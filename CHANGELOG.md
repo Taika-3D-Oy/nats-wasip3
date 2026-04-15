@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] – 2026-04-15
+
+### Added
+- DNS hostname resolution via WASI `ip-name-lookup` interface. Addresses like
+  `nats.example.com:4222` now work in addition to literal IPs.
+- `Error::Dns` variant for DNS-specific errors.
+- Integration test for DNS hostname connectivity.
+
 ## [0.3.1] – 2026-04-13
 
 ### Fixed

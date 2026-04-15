@@ -15,6 +15,7 @@ use std::task::{Context, Poll, Waker};
 use futures::future::select;
 use futures::pin_mut;
 
+use wasip3::sockets::ip_name_lookup;
 use wasip3::sockets::types::{
     ErrorCode, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress, TcpSocket,
 };
@@ -177,7 +178,7 @@ impl Drop for Client {
 impl Client {
     /// Connect to a NATS server and start background I/O loops.
     pub async fn connect(config: ConnectConfig) -> Result<Self, Error> {
-        let sock_addr = parse_address(&config.address)?;
+        let sock_addr = parse_address(&config.address).await?;
         let family = match sock_addr {
             IpSocketAddress::Ipv4(_) => IpAddressFamily::Ipv4,
             IpSocketAddress::Ipv6(_) => IpAddressFamily::Ipv6,
@@ -556,7 +557,8 @@ pub async fn with_timeout<F: Future>(timeout: Duration, future: F) -> Result<F::
 // ── P3 stream I/O helpers ──────────────────────────────────────────
 
 /// Parse "host:port" into a P3 `IpSocketAddress`.
-fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
+/// If the host is not a literal IP address, performs DNS resolution via WASI.
+async fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
     let (host, port_str) = addr
         .rsplit_once(':')
         .ok_or_else(|| Error::Protocol(format!("invalid address (no port): {addr}")))?;
@@ -579,9 +581,24 @@ fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
             scope_id: 0,
         }))
     } else {
-        Err(Error::Protocol(format!(
-            "DNS hostnames not yet supported — use an IP address: {host}"
-        )))
+        // DNS hostname — resolve via WASI ip-name-lookup.
+        use wasip3::sockets::types::IpAddress;
+        let addrs = ip_name_lookup::resolve_addresses(host.to_string()).await?;
+        let ip = addrs
+            .first()
+            .ok_or_else(|| Error::Protocol(format!("DNS resolved no addresses for: {host}")))?;
+        match ip {
+            IpAddress::Ipv4(a) => Ok(IpSocketAddress::Ipv4(Ipv4SocketAddress {
+                port,
+                address: *a,
+            })),
+            IpAddress::Ipv6(a) => Ok(IpSocketAddress::Ipv6(Ipv6SocketAddress {
+                port,
+                address: *a,
+                flow_info: 0,
+                scope_id: 0,
+            })),
+        }
     }
 }
 
@@ -755,7 +772,7 @@ async fn attempt_reconnect(
         }
         delay = if delay + delay < cap { delay + delay } else { cap };
 
-        let sock_addr = match parse_address(&config.address) {
+        let sock_addr = match parse_address(&config.address).await {
             Ok(a) => a,
             Err(_) => continue,
         };

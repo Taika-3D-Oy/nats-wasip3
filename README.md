@@ -159,7 +159,10 @@ fn main() {
 }
 
 async fn run() -> Result<(), nats_wasi::Error> {
-    let client = Client::connect(ConnectConfig::default()).await?;
+    let client = Client::connect(ConnectConfig {
+        address: "nats.example.com:4222".to_string(),
+        ..Default::default()
+    }).await?;
     let sub = client.subscribe("demo.>")?;
     client.publish("demo.hello", b"world")?;
     let msg = sub.next().await?;
@@ -167,6 +170,11 @@ async fn run() -> Result<(), nats_wasi::Error> {
     Ok(())
 }
 ```
+
+DNS hostnames (e.g. `nats.example.com:4222`) and literal IP addresses
+(`127.0.0.1:4222`, `[::1]:4222`) are both supported. DNS resolution uses
+the WASI `ip-name-lookup` interface — the host runtime resolves the name on
+the guest's behalf.
 
 ## Architecture — native P3 async
 
