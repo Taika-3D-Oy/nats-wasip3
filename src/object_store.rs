@@ -20,6 +20,7 @@ use crate::Error;
 const OBJ_STREAM_PREFIX: &str = "OBJ_";
 const OBJ_SUBJECT_PREFIX: &str = "$O";
 const DEFAULT_CHUNK_SIZE: usize = 128 * 1024;
+const MAX_LIST_BATCH_SIZE: u32 = 1000;
 
 static NEXT_CHUNK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -172,7 +173,7 @@ impl ObjectStore {
             nuid: nuid.clone(),
             size: data.len() as u64,
             chunks: chunk_count,
-            mtime: now_rfc3339_like(),
+            mtime: now_nanos_timestamp(),
             deleted: false,
             options: Some(ObjectMetaOptions {
                 max_chunk_size: Some(chunk_size),
@@ -247,7 +248,10 @@ impl ObjectStore {
             .js
             .create_consumer(&self.stream_name, &consumer_cfg)
             .await?;
-        let msgs = self.js.fetch(&self.stream_name, &info.name, 1000).await?;
+        let msgs = self
+            .js
+            .fetch(&self.stream_name, &info.name, MAX_LIST_BATCH_SIZE)
+            .await?;
 
         let mut out = Vec::new();
         for msg in msgs {
@@ -276,7 +280,7 @@ impl ObjectStore {
             nuid: meta.nuid,
             size: 0,
             chunks: 0,
-            mtime: now_rfc3339_like(),
+            mtime: now_nanos_timestamp(),
             deleted: true,
             options: meta.options,
         };
@@ -401,7 +405,7 @@ fn name_to_subject_token(name: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(name.as_bytes())
 }
 
-fn now_rfc3339_like() -> String {
+fn now_nanos_timestamp() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
