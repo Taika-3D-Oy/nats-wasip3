@@ -1,6 +1,7 @@
 # nats-wasip3
 
-A NATS client for `wasm32-wasip3` — core pub/sub, JetStream, and KV with
+A NATS client for `wasm32-wasip3` — core pub/sub, JetStream (including Object
+Store), and KV with
 CAS. Uses **native WASI P3 Component Model async I/O** (`wasip3` crate +
 `wit-bindgen`) — no wstd shim, no C/FFI dependencies.
 
@@ -143,7 +144,7 @@ cargo build --target wasm32-wasip3 --example integration_tests --features tls
 | Feature      | Default | Description                              |
 |------------- |---------|------------------------------------------|
 | `tls`        | no      | TLS via `wasi:tls` host interface (experimental — custom CAs not yet supported) |
-| `jetstream`  | no      | JetStream API (stream/consumer mgmt)     |
+| `jetstream`  | no      | JetStream API (stream/consumer/Object Store mgmt) |
 | `kv`         | yes     | NATS KV with CAS, Watch (implies `jetstream`) |
 | `nkey`       | no      | NKey authentication (Ed25519)            |
 

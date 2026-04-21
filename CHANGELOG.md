@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [0.5.0] – 2026-04-21
 
 ### Added
+- JetStream Object Store support (`object_store` module): bucket create/open,
+  put/get/list/delete, and bucket status.
 - `Client::flush(timeout)` — enqueues a PING and waits for PONG, confirming
   all prior publishes have been received by the server.
 - `Subscription::unsubscribe()` — explicit unsubscribe without needing to drop.

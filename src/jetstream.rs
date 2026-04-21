@@ -121,6 +121,20 @@ impl JetStream {
             .await
     }
 
+    /// Purge messages from a stream for a specific subject.
+    pub async fn purge_stream_subject(
+        &self,
+        name: &str,
+        subject: &str,
+    ) -> Result<PurgeResponse, Error> {
+        #[derive(Serialize)]
+        struct PurgeReq<'a> {
+            filter: &'a str,
+        }
+        self.api_request(&format!("STREAM.PURGE.{name}"), &PurgeReq { filter: subject })
+            .await
+    }
+
     // ── Publish ────────────────────────────────────────────────
 
     /// Publish to a JetStream subject and wait for ack.
