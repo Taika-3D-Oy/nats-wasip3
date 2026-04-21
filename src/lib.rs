@@ -18,6 +18,9 @@ pub mod proto;
 #[cfg(feature = "jetstream")]
 pub mod jetstream;
 
+#[cfg(feature = "jetstream")]
+pub mod object_store;
+
 #[cfg(feature = "kv")]
 pub mod kv;
 
