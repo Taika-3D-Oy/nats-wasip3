@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, Message, Duration, secs};
+use crate::client::{secs, Client, Duration, Message};
 use crate::proto::Headers;
 use crate::Error;
 
@@ -131,8 +131,11 @@ impl JetStream {
         struct PurgeReq<'a> {
             filter: &'a str,
         }
-        self.api_request(&format!("STREAM.PURGE.{name}"), &PurgeReq { filter: subject })
-            .await
+        self.api_request(
+            &format!("STREAM.PURGE.{name}"),
+            &PurgeReq { filter: subject },
+        )
+        .await
     }
 
     // ── Publish ────────────────────────────────────────────────
@@ -225,8 +228,8 @@ impl JetStream {
         loop {
             let msg = match with_timeout(timeout, sub.next()).await {
                 Ok(Ok(msg)) => msg,
-                Ok(Err(e)) => return Err(e),    // subscription error (disconnected etc.)
-                Err(_) => break,                // timeout: no more messages from server
+                Ok(Err(e)) => return Err(e), // subscription error (disconnected etc.)
+                Err(_) => break,             // timeout: no more messages from server
             };
             // A 404 or 408 status means no more messages.
             if let Some(ref h) = msg.headers {
@@ -428,10 +431,7 @@ impl Drop for ConsumerMessages {
         // Fire-and-forget ephemeral consumer cleanup. Requires a reply-to so
         // the JetStream server actually processes the DELETE; we never read
         // the reply.
-        let subject = format!(
-            "$JS.API.CONSUMER.DELETE.{}.{}",
-            self.stream, self.consumer
-        );
+        let subject = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream, self.consumer);
         let inbox = self.client.new_inbox();
         let _ = self.client.publish_with_reply(&subject, &inbox, b"");
     }

@@ -138,7 +138,8 @@ impl ObjectStore {
 
     /// Put an object into the bucket.
     pub async fn put(&self, name: &str, data: &[u8]) -> Result<ObjectInfo, Error> {
-        self.put_with_chunk_size(name, data, self.max_chunk_size).await
+        self.put_with_chunk_size(name, data, self.max_chunk_size)
+            .await
     }
 
     /// Put an object with a custom chunk size.
