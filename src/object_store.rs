@@ -158,13 +158,15 @@ impl ObjectStore {
         }
 
         let old = self.get_meta(name).await?;
-        let nuid = next_nuid();
+        let nuid = generate_chunk_subject_id()?;
         let chunk_subject = self.chunk_subject(&nuid);
 
         let mut chunk_count: u32 = 0;
         for chunk in data.chunks(chunk_size) {
             self.js.publish(&chunk_subject, chunk).await?;
-            chunk_count = chunk_count.saturating_add(1);
+            chunk_count = chunk_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Protocol("object chunk count overflow".into()))?;
         }
 
         let meta = ObjectMeta {
@@ -400,9 +402,10 @@ fn meta_to_info(meta: ObjectMeta) -> ObjectInfo {
     }
 }
 
-fn next_nuid() -> String {
+fn generate_chunk_subject_id() -> Result<String, Error> {
+    let now = now_unix_nanos()?;
     let id = NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
-    format!("O{id:016x}")
+    Ok(format!("O{now:032x}{id:016x}"))
 }
 
 fn name_to_subject_token(name: &str) -> String {
@@ -411,11 +414,15 @@ fn name_to_subject_token(name: &str) -> String {
 }
 
 fn now_nanos_timestamp() -> Result<String, Error> {
-    let nanos = SystemTime::now()
+    let nanos = now_unix_nanos()?;
+    Ok(format!("{nanos}"))
+}
+
+fn now_unix_nanos() -> Result<u128, Error> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::Protocol(format!("system time before unix epoch: {e}")))?
-        .as_nanos();
-    Ok(format!("{nanos}"))
+        .as_nanos())
 }
 
 #[cfg(test)]
@@ -429,8 +436,8 @@ mod tests {
 
     #[test]
     fn chunk_id_monotonic() {
-        let a = next_nuid();
-        let b = next_nuid();
+        let a = generate_chunk_subject_id().unwrap();
+        let b = generate_chunk_subject_id().unwrap();
         assert!(b > a);
     }
 }
