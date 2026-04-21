@@ -48,8 +48,11 @@ pub struct KvConfig {
     pub history: u8,
     pub max_value_size: i32,
     pub max_bytes: i64,
-    /// Time-to-live in nanoseconds.
+    /// Bucket-wide time-to-live in nanoseconds. Applies to every entry.
     pub ttl: Option<Duration>,
+    /// Allow per-message TTL via [`KeyValue::put_with_ttl`] etc.
+    /// Requires NATS server 2.11+.
+    pub allow_msg_ttl: bool,
     pub storage: Storage,
     pub num_replicas: u32,
 }
@@ -62,6 +65,7 @@ impl Default for KvConfig {
             max_value_size: -1,
             max_bytes: -1,
             ttl: None,
+            allow_msg_ttl: false,
             storage: Storage::File,
             num_replicas: 1,
         }
@@ -81,6 +85,7 @@ impl KeyValue {
             max_msgs: -1,
             max_bytes: config.max_bytes,
             max_msg_size: config.max_value_size,
+            max_msgs_per_subject: config.history as i64,
             storage: config.storage,
             num_replicas: config.num_replicas,
             discard: DiscardPolicy::New,
@@ -88,6 +93,7 @@ impl KeyValue {
             duplicate_window: None,
             allow_direct: true,
             allow_rollup_hdrs: true,
+            allow_msg_ttl: config.allow_msg_ttl,
         };
 
         js.create_stream(&stream_config).await?;
@@ -169,10 +175,54 @@ impl KeyValue {
         Ok(ack.seq)
     }
 
+    /// Put a value with a per-message TTL. Returns the revision.
+    ///
+    /// Requires the bucket to have been created with `allow_msg_ttl: true`
+    /// (NATS server 2.11+). The TTL is rounded down to whole seconds, with
+    /// a minimum effective value of 1 second.
+    pub async fn put_with_ttl(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<u64, Error> {
+        let mut headers = Headers::new();
+        headers.insert("Nats-TTL", format_ttl(ttl));
+        let subject = self.subject(key);
+        let ack = self
+            .js
+            .publish_with_headers(&subject, &headers, value)
+            .await?;
+        Ok(ack.seq)
+    }
+
     /// Create a key only if it doesn't exist. Returns the revision.
     pub async fn create(&self, key: &str, value: &[u8]) -> Result<u64, Error> {
         let mut headers = Headers::new();
         headers.insert("Nats-Expected-Last-Subject-Sequence", "0");
+        let subject = self.subject(key);
+        match self
+            .js
+            .publish_with_headers(&subject, &headers, value)
+            .await
+        {
+            Ok(ack) => Ok(ack.seq),
+            Err(Error::JetStream { code: 400, .. }) => Err(Error::KeyExists),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create a key only if it doesn't exist, with a per-message TTL.
+    /// See [`KeyValue::put_with_ttl`] for TTL semantics.
+    pub async fn create_with_ttl(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl: Duration,
+    ) -> Result<u64, Error> {
+        let mut headers = Headers::new();
+        headers.insert("Nats-Expected-Last-Subject-Sequence", "0");
+        headers.insert("Nats-TTL", format_ttl(ttl));
         let subject = self.subject(key);
         match self
             .js
@@ -197,6 +247,33 @@ impl KeyValue {
             "Nats-Expected-Last-Subject-Sequence",
             expected_revision.to_string(),
         );
+        let subject = self.subject(key);
+        match self
+            .js
+            .publish_with_headers(&subject, &headers, value)
+            .await
+        {
+            Ok(ack) => Ok(ack.seq),
+            Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Compare-and-swap update with a per-message TTL.
+    /// See [`KeyValue::put_with_ttl`] for TTL semantics.
+    pub async fn update_with_ttl(
+        &self,
+        key: &str,
+        value: &[u8],
+        expected_revision: u64,
+        ttl: Duration,
+    ) -> Result<u64, Error> {
+        let mut headers = Headers::new();
+        headers.insert(
+            "Nats-Expected-Last-Subject-Sequence",
+            expected_revision.to_string(),
+        );
+        headers.insert("Nats-TTL", format_ttl(ttl));
         let subject = self.subject(key);
         match self
             .js
@@ -430,5 +507,39 @@ impl KvWatcher {
                 operation,
             });
         }
+    }
+}
+
+/// Format a nanosecond `Duration` as a NATS `Nats-TTL` header value.
+///
+/// NATS expects a Go-style duration string (e.g. `"30s"`, `"5m"`, `"1h"`).
+/// We round down to whole seconds with a minimum of 1 second, since the
+/// server enforces TTL with second granularity.
+fn format_ttl(ttl: Duration) -> String {
+    let secs = (ttl / 1_000_000_000).max(1);
+    format!("{secs}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{millis, secs};
+
+    #[test]
+    fn format_ttl_seconds() {
+        assert_eq!(format_ttl(secs(30)), "30s");
+        assert_eq!(format_ttl(secs(3600)), "3600s");
+    }
+
+    #[test]
+    fn format_ttl_subsecond_rounds_to_one() {
+        assert_eq!(format_ttl(millis(500)), "1s");
+        assert_eq!(format_ttl(0), "1s");
+    }
+
+    #[test]
+    fn format_ttl_truncates_partial() {
+        // 1.999 seconds → 1s (truncation, server has second granularity)
+        assert_eq!(format_ttl(1_999_000_000), "1s");
     }
 }

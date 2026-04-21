@@ -166,7 +166,7 @@ impl Default for ConnectOptions {
             verbose: false,
             pedantic: false,
             name: None,
-            lang: "rust-wasi",
+            lang: "nats-wasip3",
             version: env!("CARGO_PKG_VERSION"),
             user: None,
             pass: None,
@@ -736,7 +736,7 @@ mod tests {
         let s = std::str::from_utf8(&data).unwrap();
         assert!(s.starts_with("CONNECT {"));
         assert!(s.ends_with("}\r\n"));
-        assert!(s.contains("\"lang\":\"rust-wasi\""));
+        assert!(s.contains("\"lang\":\"nats-wasip3\""));
         assert!(s.contains("\"headers\":true"));
         assert!(s.contains("\"echo\":true"));
         assert!(s.contains("\"no_responders\":true"));

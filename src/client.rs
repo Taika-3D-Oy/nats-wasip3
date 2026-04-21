@@ -62,6 +62,11 @@ impl Drop for Subscription {
         inner.subscriptions.remove(&self.sid);
         let unsub = proto::encode_unsub(&self.sid, None);
         inner.write_buf.extend_from_slice(&unsub);
+        // Wake the flush loop so the UNSUB is sent promptly rather than
+        // sitting in write_buf until the next user publish/subscribe.
+        if let Some(w) = inner.flush_waker.take() {
+            w.wake();
+        }
     }
 }
 
@@ -1017,6 +1022,12 @@ async fn flush_loop(inner: Rc<RefCell<Inner>>, mut writer: StreamWriter<u8>) {
         };
 
         if stream_write_all(&mut writer, &data).await.is_err() {
+            // Re-queue the data so it will be retried once the reconnect
+            // logic delivers a new writer via `inner.new_writer`.
+            let mut inner_ref = inner.borrow_mut();
+            let mut requeued = data;
+            requeued.extend_from_slice(&inner_ref.write_buf);
+            inner_ref.write_buf = requeued;
             continue;
         }
     }

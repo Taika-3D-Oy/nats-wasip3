@@ -211,7 +211,8 @@ impl JetStream {
         loop {
             let msg = match with_timeout(timeout, sub.next()).await {
                 Ok(Ok(msg)) => msg,
-                _ => break,
+                Ok(Err(e)) => return Err(e),    // subscription error (disconnected etc.)
+                Err(_) => break,                // timeout: no more messages from server
             };
             // A 404 or 408 status means no more messages.
             if let Some(ref h) = msg.headers {
@@ -482,6 +483,9 @@ pub struct StreamConfig {
     pub max_bytes: i64,
     #[serde(default)]
     pub max_msg_size: i32,
+    /// Maximum number of messages per unique subject. Used by KV for history.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub max_msgs_per_subject: i64,
     #[serde(default)]
     pub storage: Storage,
     #[serde(default)]
@@ -496,6 +500,17 @@ pub struct StreamConfig {
     pub allow_direct: bool,
     #[serde(default)]
     pub allow_rollup_hdrs: bool,
+    /// Allow per-message TTL via the `Nats-TTL` header (NATS server 2.11+).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_msg_ttl: bool,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

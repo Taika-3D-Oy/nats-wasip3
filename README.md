@@ -150,15 +150,19 @@ cargo build --target wasm32-wasip3 --example integration_tests --features tls
 ## Quick start
 
 ```rust
-use nats_wasi::client::{Client, ConnectConfig};
+use nats_wasip3::client::{Client, ConnectConfig};
 
-fn main() {
-    wit_bindgen::block_on(async {
-        run().await.unwrap();
-    });
+wasip3::cli::command::export!(NatsDemo);
+
+struct NatsDemo;
+
+impl wasip3::exports::cli::run::Guest for NatsDemo {
+    async fn run() -> Result<(), ()> {
+        run().await.map_err(|e| eprintln!("error: {e}"))
+    }
 }
 
-async fn run() -> Result<(), nats_wasi::Error> {
+async fn run() -> Result<(), nats_wasip3::Error> {
     let client = Client::connect(ConnectConfig {
         address: "nats.example.com:4222".to_string(),
         ..Default::default()
