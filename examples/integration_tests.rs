@@ -1100,6 +1100,288 @@ async fn test_kv_delete_then_create() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  Object Store tests
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_put_get() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_put").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_put".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let info = store.put("hello.txt", b"hello world").await.unwrap();
+    assert_eq!(info.name, "hello.txt");
+    assert_eq!(info.size, 11);
+    assert!(!info.deleted);
+
+    let obj = store.get("hello.txt").await.unwrap().expect("object should exist");
+    assert_eq!(obj.info.name, "hello.txt");
+    assert_eq!(obj.data, b"hello world");
+
+    // Non-existent object returns None.
+    let none = store.get("does_not_exist").await.unwrap();
+    assert!(none.is_none());
+
+    js.delete_stream("OBJ_objtest_put").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_list() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_list").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_list".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    store.put("file1.txt", b"one").await.unwrap();
+    store.put("file2.txt", b"two").await.unwrap();
+    store.put("file3.txt", b"three").await.unwrap();
+
+    let items = store.list().await.unwrap();
+    assert_eq!(items.len(), 3);
+    let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    assert!(names.contains(&"file1.txt"));
+    assert!(names.contains(&"file2.txt"));
+    assert!(names.contains(&"file3.txt"));
+
+    js.delete_stream("OBJ_objtest_list").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_delete() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_del").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_del".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    store.put("todelete.bin", b"goodbye").await.unwrap();
+
+    // Confirm it exists.
+    assert!(store.get("todelete.bin").await.unwrap().is_some());
+
+    // Delete it.
+    let deleted = store.delete("todelete.bin").await.unwrap();
+    assert!(deleted);
+
+    // Should be gone from get.
+    assert!(store.get("todelete.bin").await.unwrap().is_none());
+
+    // Should not appear in list.
+    let items = store.list().await.unwrap();
+    assert!(!items.iter().any(|i| i.name == "todelete.bin"));
+
+    // Deleting non-existent object returns false.
+    let not_found = store.delete("no_such_object").await.unwrap();
+    assert!(!not_found);
+
+    js.delete_stream("OBJ_objtest_del").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_overwrite() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_ow").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_ow".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    store.put("versioned.dat", b"version 1").await.unwrap();
+    store.put("versioned.dat", b"version 2 updated").await.unwrap();
+
+    // Only the latest version should be returned.
+    let obj = store.get("versioned.dat").await.unwrap().expect("should exist");
+    assert_eq!(obj.data, b"version 2 updated");
+
+    // List should show the object only once.
+    let items = store.list().await.unwrap();
+    assert_eq!(items.iter().filter(|i| i.name == "versioned.dat").count(), 1);
+
+    js.delete_stream("OBJ_objtest_ow").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_large_object() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_large").await;
+
+    // Use a small chunk size to force multi-chunk behaviour.
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_large".into(),
+            max_chunk_size: 1024,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // 10 KiB object → 10 chunks of 1 KiB each.
+    let data: Vec<u8> = (0u8..=255).cycle().take(10 * 1024).collect();
+    let info = store.put("big.bin", &data).await.unwrap();
+    assert_eq!(info.size, data.len() as u64);
+    assert_eq!(info.chunks, 10);
+
+    let obj = store.get("big.bin").await.unwrap().expect("should exist");
+    assert_eq!(obj.data, data, "reassembled data must match original");
+
+    js.delete_stream("OBJ_objtest_large").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_info() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_info").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_info".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Info on non-existent object.
+    let none = store.info("ghost").await.unwrap();
+    assert!(none.is_none());
+
+    store.put("readme.md", b"# Hello").await.unwrap();
+    let info = store.info("readme.md").await.unwrap().expect("should have info");
+    assert_eq!(info.name, "readme.md");
+    assert_eq!(info.size, 7);
+    assert_eq!(info.bucket, "objtest_info");
+    assert!(!info.deleted);
+
+    js.delete_stream("OBJ_objtest_info").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_status() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_status").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_status".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    store.put("a", b"aaa").await.unwrap();
+    store.put("b", b"bbbb").await.unwrap();
+
+    let status = store.status().await.unwrap();
+    assert_eq!(status.bucket, "objtest_status");
+    assert_eq!(status.objects, 2);
+    assert!(status.bytes > 0);
+    assert!(status.ttl.is_none());
+
+    js.delete_stream("OBJ_objtest_status").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_open_existing() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_objtest_open").await;
+
+    // Create and populate.
+    let store1 = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "objtest_open".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    store1.put("persist.txt", b"persistent").await.unwrap();
+
+    // Open without creating.
+    let store2 = ObjectStore::open(js.clone(), "objtest_open");
+    assert_eq!(store2.bucket(), "objtest_open");
+    let obj = store2.get("persist.txt").await.unwrap().expect("should exist");
+    assert_eq!(obj.data, b"persistent");
+
+    js.delete_stream("OBJ_objtest_open").await.unwrap();
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  TLS tests
 // ══════════════════════════════════════════════════════════════════
 
@@ -1326,6 +1608,19 @@ async fn run_tests() {
         run_test!("test_kv_update_wrong_revision", test_kv_update_wrong_revision().await);
         run_test!("test_kv_put_overwrite", test_kv_put_overwrite().await);
         run_test!("test_kv_delete_then_create", test_kv_delete_then_create().await);
+    }
+
+    // ── Object Store ───────────────────────────────────────────
+    #[cfg(feature = "jetstream")]
+    {
+        run_test!("test_object_store_put_get", test_object_store_put_get().await);
+        run_test!("test_object_store_list", test_object_store_list().await);
+        run_test!("test_object_store_delete", test_object_store_delete().await);
+        run_test!("test_object_store_overwrite", test_object_store_overwrite().await);
+        run_test!("test_object_store_large_object", test_object_store_large_object().await);
+        run_test!("test_object_store_info", test_object_store_info().await);
+        run_test!("test_object_store_status", test_object_store_status().await);
+        run_test!("test_object_store_open_existing", test_object_store_open_existing().await);
     }
 
     // ── TLS ────────────────────────────────────────────────────

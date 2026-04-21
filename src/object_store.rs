@@ -220,6 +220,11 @@ impl ObjectStore {
                 .fetch(&self.stream_name, &info.name, meta.chunks)
                 .await?
         };
+        // Clean up the ephemeral consumer — fire-and-forget, same pattern as ConsumerMessages::Drop.
+        let inbox = self.js.client().new_inbox();
+        let del = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream_name, info.name);
+        let _ = self.js.client().publish_with_reply(&del, &inbox, b"");
+
         let mut out = Vec::with_capacity(meta.size as usize);
         for msg in msgs {
             out.extend_from_slice(&msg.payload);
@@ -259,6 +264,10 @@ impl ObjectStore {
             .js
             .fetch(&self.stream_name, &info.name, MAX_LIST_BATCH_SIZE)
             .await?;
+        // Clean up the ephemeral consumer.
+        let inbox = self.js.client().new_inbox();
+        let del = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream_name, info.name);
+        let _ = self.js.client().publish_with_reply(&del, &inbox, b"");
 
         let mut out = Vec::new();
         for msg in msgs {

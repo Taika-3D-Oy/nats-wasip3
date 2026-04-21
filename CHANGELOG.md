@@ -2,11 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] – 2026-04-21
+
+### Added
+- JetStream Object Store (`object_store` module, behind `jetstream` feature):
+  `ObjectStore::new` / `open`, `put`, `put_with_chunk_size`, `get`, `info`,
+  `list`, `delete`, `status`. Objects are chunked (default 128 KiB) and backed
+  by an `OBJ_*` JetStream stream.
+- `JetStream::purge_stream_subject(stream, subject)` — subject-filtered stream
+  purge, used internally by Object Store and available to all JetStream users.
+
+### Fixed
+- `ObjectStore::get` and `ObjectStore::list` leaked ephemeral pull consumers on
+  the server; they now send a fire-and-forget `CONSUMER.DELETE` after the fetch.
+
 ## [0.5.0] – 2026-04-21
 
 ### Added
-- JetStream Object Store support (`object_store` module): bucket create/open,
-  put/get/list/delete, and bucket status.
 - `Client::flush(timeout)` — enqueues a PING and waits for PONG, confirming
   all prior publishes have been received by the server.
 - `Subscription::unsubscribe()` — explicit unsubscribe without needing to drop.
