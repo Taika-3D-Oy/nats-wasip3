@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Duration;
@@ -60,6 +61,7 @@ impl Default for ObjectStoreConfig {
 }
 
 /// Runtime status / statistics for an Object Store bucket.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct ObjectStoreStatus {
     pub bucket: String,
@@ -70,6 +72,7 @@ pub struct ObjectStoreStatus {
 }
 
 /// An object returned by [`ObjectStore::get`].
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct Object {
     pub info: ObjectInfo,
@@ -77,6 +80,7 @@ pub struct Object {
 }
 
 /// Public object metadata.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
     pub name: String,
@@ -87,6 +91,10 @@ pub struct ObjectInfo {
     pub mtime: String,
     pub deleted: bool,
     pub max_chunk_size: Option<usize>,
+    /// SHA-256 digest in the form `"SHA-256=<base64url-no-pad>"` as per the
+    /// NATS object store specification. `None` for objects created without
+    /// digest support (e.g. tombstones).
+    pub digest: Option<String>,
 }
 
 impl ObjectStore {
@@ -161,6 +169,9 @@ impl ObjectStore {
         let nuid = generate_chunk_subject_id()?;
         let chunk_subject = self.chunk_subject(&nuid);
 
+        // Compute SHA-256 over the full object before chunking.
+        let digest = compute_digest(data);
+
         let mut chunk_count: u32 = 0;
         for chunk in data.chunks(chunk_size) {
             self.js.publish(&chunk_subject, chunk).await?;
@@ -177,6 +188,7 @@ impl ObjectStore {
             chunks: chunk_count,
             mtime: now_nanos_timestamp()?,
             deleted: false,
+            digest: Some(digest),
             options: Some(ObjectMetaOptions {
                 max_chunk_size: Some(chunk_size),
             }),
@@ -232,6 +244,16 @@ impl ObjectStore {
 
         if out.len() as u64 != meta.size {
             return Err(Error::Protocol("object data size mismatch".into()));
+        }
+
+        // Verify SHA-256 digest if the metadata carries one.
+        if let Some(ref stored_digest) = meta.digest {
+            let actual = compute_digest(&out);
+            if actual != *stored_digest {
+                return Err(Error::Protocol(format!(
+                    "object digest mismatch: stored={stored_digest}, actual={actual}"
+                )));
+            }
         }
 
         Ok(Some(Object {
@@ -298,6 +320,7 @@ impl ObjectStore {
             chunks: 0,
             mtime: now_nanos_timestamp()?,
             deleted: true,
+            digest: None,
             options: meta.options,
         };
         self.publish_meta(&tombstone).await?;
@@ -388,6 +411,9 @@ struct ObjectMeta {
     mtime: String,
     #[serde(default)]
     deleted: bool,
+    /// SHA-256 digest: `"SHA-256=<base64url-no-pad>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     options: Option<ObjectMetaOptions>,
 }
@@ -407,8 +433,17 @@ fn meta_to_info(meta: ObjectMeta) -> ObjectInfo {
         chunks: meta.chunks,
         mtime: meta.mtime,
         deleted: meta.deleted,
+        digest: meta.digest,
         max_chunk_size: meta.options.and_then(|o| o.max_chunk_size),
     }
+}
+
+/// Compute the NATS object store digest: `"SHA-256=<base64url-no-pad>"`.
+fn compute_digest(data: &[u8]) -> String {
+    use base64::Engine;
+    let hash = Sha256::digest(data);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_slice());
+    format!("SHA-256={b64}")
 }
 
 fn generate_chunk_subject_id() -> Result<String, Error> {

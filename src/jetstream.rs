@@ -541,6 +541,7 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Retention {
@@ -550,6 +551,7 @@ pub enum Retention {
     Workqueue,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Storage {
@@ -558,6 +560,7 @@ pub enum Storage {
     Memory,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiscardPolicy {
@@ -566,12 +569,14 @@ pub enum DiscardPolicy {
     New,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub struct StreamInfo {
     pub config: StreamConfig,
     pub state: StreamState,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub struct StreamState {
     pub messages: u64,
@@ -586,12 +591,14 @@ struct DeleteResponse {
     success: bool,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub struct PurgeResponse {
     pub success: bool,
     pub purged: u64,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub struct PubAck {
     pub stream: String,
@@ -638,6 +645,7 @@ pub struct ConsumerConfig {
     pub headers_only: Option<bool>,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeliverPolicy {
@@ -651,6 +659,7 @@ pub enum DeliverPolicy {
     LastPerSubject,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplayPolicy {
@@ -659,6 +668,7 @@ pub enum ReplayPolicy {
     Original,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AckPolicy {
@@ -668,6 +678,7 @@ pub enum AckPolicy {
     All,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Deserialize)]
 pub struct ConsumerInfo {
     pub name: String,

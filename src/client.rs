@@ -30,6 +30,7 @@ use crate::Error;
 // ── Public types ───────────────────────────────────────────────────
 
 /// A received message (unified from MSG and HMSG).
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct Message {
     pub subject: String,
@@ -113,11 +114,22 @@ pub const fn millis(n: u64) -> Duration {
 /// Connection configuration.
 #[derive(Clone)]
 pub struct ConnectConfig {
+    /// Primary server address ("host:port"). Always tried first.
     pub address: String,
+    /// Additional server addresses tried on connect and on reconnect,
+    /// round-robined with `address` and any cluster URLs from server INFO.
+    pub servers: Vec<String>,
     pub name: Option<String>,
     pub auth_token: Option<String>,
     pub user: Option<String>,
     pub pass: Option<String>,
+    /// JWT credential for NATS 2.0 operator authentication. When set together
+    /// with `nkey_seed` (or via `credentials`), the server nonce is signed.
+    pub jwt: Option<String>,
+    /// Raw content of a NATS `.creds` file (JWT + NKey seed blocks).
+    /// When set, overrides `jwt` and `nkey_seed`. Requires the `nkey` feature.
+    #[cfg(feature = "nkey")]
+    pub credentials: Option<String>,
     pub tls: bool,
     #[cfg(feature = "tls")]
     pub tls_server_name: Option<String>,
@@ -130,16 +142,26 @@ pub struct ConnectConfig {
     pub max_reconnect_attempts: u32,
     /// Base reconnection delay (nanoseconds, doubles each attempt, cap 8 s). Default: 250 ms.
     pub reconnect_delay: Duration,
+    /// Maximum number of pending messages per subscription before the oldest
+    /// is dropped (slow-consumer protection). Default: 512.
+    pub subscription_capacity: usize,
+    /// Maximum number of bytes buffered for outbound writes. `publish()` returns
+    /// `Err(Error::BufferFull)` when this limit is exceeded. Default: 8 MiB.
+    pub max_pending_write_bytes: usize,
 }
 
 impl Default for ConnectConfig {
     fn default() -> Self {
         Self {
             address: "127.0.0.1:4222".to_string(),
+            servers: Vec::new(),
             name: Some("nats-wasi".to_string()),
             auth_token: None,
             user: None,
             pass: None,
+            jwt: None,
+            #[cfg(feature = "nkey")]
+            credentials: None,
             tls: false,
             #[cfg(feature = "tls")]
             tls_server_name: None,
@@ -147,6 +169,8 @@ impl Default for ConnectConfig {
             nkey_seed: None,
             max_reconnect_attempts: 5,
             reconnect_delay: millis(250),
+            subscription_capacity: 512,
+            max_pending_write_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -176,6 +200,12 @@ struct Inner {
     close_error: Option<String>,
     /// Set by reconnect logic; picked up by the flush loop.
     new_writer: Option<StreamWriter<u8>>,
+    /// Cluster node URLs learned from server INFO `connect_urls`.
+    known_servers: Vec<String>,
+    /// Maximum pending messages per subscription mailbox.
+    mailbox_capacity: usize,
+    /// Maximum outbound write buffer in bytes.
+    write_buf_limit: usize,
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -314,6 +344,9 @@ impl Client {
             closed: false,
             close_error: None,
             new_writer: None,
+            known_servers: info.connect_urls.clone(),
+            mailbox_capacity: config.subscription_capacity,
+            write_buf_limit: config.max_pending_write_bytes,
         }));
 
         // ── Spawn read loop ────────────────────────────────────
@@ -349,7 +382,7 @@ impl Client {
     pub fn publish(&self, subject: &str, payload: &[u8]) -> Result<(), Error> {
         self.check_closed()?;
         let data = proto::encode_pub(subject, None, payload)?;
-        self.enqueue_write(&data);
+        self.enqueue_write(&data)?;
         Ok(())
     }
 
@@ -362,7 +395,7 @@ impl Client {
     ) -> Result<(), Error> {
         self.check_closed()?;
         let data = proto::encode_pub(subject, Some(reply_to), payload)?;
-        self.enqueue_write(&data);
+        self.enqueue_write(&data)?;
         Ok(())
     }
 
@@ -376,7 +409,7 @@ impl Client {
     ) -> Result<(), Error> {
         self.check_closed()?;
         let data = proto::encode_hpub(subject, reply_to, headers, payload)?;
-        self.enqueue_write(&data);
+        self.enqueue_write(&data)?;
         Ok(())
     }
 
@@ -385,7 +418,7 @@ impl Client {
         self.check_closed()?;
         let sid = self.next_sid();
         let data = proto::encode_sub(subject, &sid)?;
-        self.enqueue_write(&data);
+        self.enqueue_write(&data)?;
 
         let mut inner = self.inner.borrow_mut();
         inner.mailboxes.insert(
@@ -414,7 +447,7 @@ impl Client {
         self.check_closed()?;
         let sid = self.next_sid();
         let data = proto::encode_sub_queue(subject, queue, &sid)?;
-        self.enqueue_write(&data);
+        self.enqueue_write(&data)?;
 
         let mut inner = self.inner.borrow_mut();
         inner.mailboxes.insert(
@@ -464,7 +497,7 @@ impl Client {
                 },
             );
         }
-        self.enqueue_write(&batch);
+        self.enqueue_write(&batch)?;
 
         let reply_fut = RequestFuture {
             sid: sid.clone(),
@@ -515,7 +548,7 @@ impl Client {
                 },
             );
         }
-        self.enqueue_write(&batch);
+        self.enqueue_write(&batch)?;
 
         let reply_fut = RequestFuture {
             sid: sid.clone(),
@@ -583,12 +616,16 @@ impl Client {
         format!("_INBOX.{id}")
     }
 
-    fn enqueue_write(&self, data: &[u8]) {
+    fn enqueue_write(&self, data: &[u8]) -> Result<(), Error> {
         let mut inner = self.inner.borrow_mut();
+        if inner.write_buf.len() + data.len() > inner.write_buf_limit {
+            return Err(Error::BufferFull);
+        }
         inner.write_buf.extend_from_slice(data);
         if let Some(w) = inner.flush_waker.take() {
             w.wake();
         }
+        Ok(())
     }
 }
 
@@ -607,8 +644,9 @@ pub async fn with_timeout<F: Future>(timeout: Duration, future: F) -> Result<F::
 
 // ── P3 stream I/O helpers ──────────────────────────────────────────
 
-/// Build a `ConnectOptions` from config + server INFO, signing the nonce
-/// with an NKey if `nkey_seed` is set.
+/// Build a `ConnectOptions` from config + server INFO.
+/// Handles plain auth (user/pass/token), bare JWT, NKey, and full
+/// NATS 2.0 operator credentials (JWT + NKey signature).
 fn build_connect_opts(
     config: &ConnectConfig,
     _info: &proto::ServerInfo,
@@ -620,22 +658,73 @@ fn build_connect_opts(
         user: config.user.clone(),
         pass: config.pass.clone(),
         auth_token: config.auth_token.clone(),
+        jwt: config.jwt.clone(),
         tls_required: use_tls,
         ..Default::default()
     };
 
     #[cfg(feature = "nkey")]
-    if let Some(ref seed) = config.nkey_seed {
-        let kp = crate::nkey::KeyPair::from_seed(seed)?;
-        let nonce = _info
-            .nonce
-            .as_deref()
-            .ok_or_else(|| Error::Protocol("server did not send nonce for nkey auth".into()))?;
-        opts.sig = Some(kp.sign(nonce.as_bytes()));
-        opts.nkey = Some(kp.public_key());
+    {
+        // `credentials` overrides the individual `jwt` / `nkey_seed` fields.
+        if let Some(ref creds) = config.credentials {
+            let (jwt, seed) = parse_creds(creds)?;
+            opts.jwt = Some(jwt);
+            let kp = crate::nkey::KeyPair::from_seed(&seed)?;
+            let nonce = _info
+                .nonce
+                .as_deref()
+                .ok_or_else(|| Error::Protocol("server did not send nonce for nkey auth".into()))?;
+            opts.sig = Some(kp.sign(nonce.as_bytes()));
+            opts.nkey = Some(kp.public_key());
+        } else if let Some(ref seed) = config.nkey_seed {
+            let kp = crate::nkey::KeyPair::from_seed(seed)?;
+            let nonce = _info
+                .nonce
+                .as_deref()
+                .ok_or_else(|| Error::Protocol("server did not send nonce for nkey auth".into()))?;
+            opts.sig = Some(kp.sign(nonce.as_bytes()));
+            opts.nkey = Some(kp.public_key());
+        }
     }
 
     Ok(opts)
+}
+
+/// Parse a NATS `.creds` file, returning `(jwt, nkey_seed)`.
+/// Tolerates any number of leading/trailing dashes in block markers.
+#[cfg(feature = "nkey")]
+fn parse_creds(content: &str) -> Result<(String, String), Error> {
+    let jwt = extract_creds_field(content, "NATS USER JWT")
+        .ok_or_else(|| Error::Protocol("credentials: missing NATS USER JWT block".into()))?;
+    let seed = extract_creds_field(content, "USER NKEY SEED")
+        .ok_or_else(|| Error::Protocol("credentials: missing USER NKEY SEED block".into()))?;
+    Ok((jwt, seed))
+}
+
+/// Extract the value from a PEM-like block identified by `tag`.
+/// Matches any line containing `BEGIN {tag}` / `END {tag}` (dash-count agnostic).
+#[cfg(feature = "nkey")]
+fn extract_creds_field(content: &str, tag: &str) -> Option<String> {
+    let begin_marker = format!("BEGIN {tag}");
+    let end_marker = format!("END {tag}");
+    let mut in_block = false;
+    let mut value = String::new();
+    for line in content.lines() {
+        if line.contains(&begin_marker) {
+            in_block = true;
+            continue;
+        }
+        if line.contains(&end_marker) {
+            break;
+        }
+        if in_block {
+            let t = line.trim();
+            if !t.is_empty() {
+                value.push_str(t);
+            }
+        }
+    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 /// Parse "host:port" into a P3 `IpSocketAddress`.
@@ -838,7 +927,11 @@ async fn read_loop(
                 None => {
                     let mut inner = inner.borrow_mut();
                     inner.closed = true;
-                    inner.close_error = Some("reconnection failed".into());
+                    // Preserve a permanent error set by attempt_reconnect
+                    // (e.g. authorization violation) over the generic message.
+                    if inner.close_error.is_none() {
+                        inner.close_error = Some("reconnection failed".into());
+                    }
                     wake_all(&mut inner);
                     return;
                 }
@@ -879,20 +972,32 @@ async fn attempt_reconnect(
     let mut delay = config.reconnect_delay;
     let cap = secs(8);
 
-    for _ in 0..max {
+    // Build the full candidate list: primary + user-supplied extras +
+    // cluster URLs learned from server INFO. Deduplicate, preserve order.
+    let mut candidates: Vec<String> = {
+        let mut v = Vec::with_capacity(1 + config.servers.len() + 4);
+        v.push(config.address.clone());
+        v.extend(config.servers.iter().cloned());
+        v.extend(inner.borrow().known_servers.iter().cloned());
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|s| seen.insert(s.clone()));
+        v
+    };
+    let ncandidates = candidates.len().max(1);
+
+    for attempt in 0..max {
         wasip3::clocks::monotonic_clock::wait_for(delay).await;
-        // Abort reconnection if the client was closed.
         if inner.borrow().closed {
             return None;
         }
         delay = if delay + delay < cap { delay + delay } else { cap };
         // Add ±25% jitter to spread out reconnection storms.
-        // Use a simple deterministic mix derived from the current delay value.
         let jitter_range = delay / 4;
         let jitter_offset = (delay.wrapping_mul(0x9e3779b97f4a7c15) >> 32) % jitter_range.max(1);
         delay = delay.saturating_sub(jitter_range / 2).saturating_add(jitter_offset);
 
-        let sock_addr = match parse_address(&config.address).await {
+        let addr = candidates[attempt as usize % ncandidates].clone();
+        let sock_addr = match parse_address(&addr).await {
             Ok(a) => a,
             Err(_) => continue,
         };
@@ -929,6 +1034,17 @@ async fn attempt_reconnect(
             None => continue,
         };
 
+        // Absorb any new cluster URLs so subsequent attempts can try them.
+        if !info.connect_urls.is_empty() {
+            let mut inner_ref = inner.borrow_mut();
+            for url in &info.connect_urls {
+                if !candidates.contains(url) {
+                    inner_ref.known_servers.push(url.clone());
+                    candidates.push(url.clone());
+                }
+            }
+        }
+
         // Upgrade to TLS if needed.
         let use_tls = config.tls || info.tls_required;
         #[cfg(not(feature = "tls"))]
@@ -943,9 +1059,7 @@ async fn attempt_reconnect(
                     .tls_server_name
                     .clone()
                     .unwrap_or_else(|| {
-                        config
-                            .address
-                            .rsplit_once(':')
+                        addr.rsplit_once(':')
                             .map(|(h, _)| h.to_string())
                             .unwrap_or_default()
                     });
@@ -971,10 +1085,10 @@ async fn attempt_reconnect(
             continue;
         }
 
-        // Wait for PONG.
+        // Wait for PONG; detect and abort on permanent auth failures.
         buf.clear();
         let mut got_pong = false;
-        for _ in 0..50 {
+        'pong: for _ in 0..50 {
             let prev = buf.len();
             stream_read(&mut rx, &mut buf).await;
             if buf.len() == prev {
@@ -985,21 +1099,32 @@ async fn attempt_reconnect(
                 match op {
                     ServerOp::Pong => {
                         got_pong = true;
-                        break;
+                        break 'pong;
                     }
-                    ServerOp::Ok => continue,
-                    _ => break,
+                    ServerOp::Ok => {}
+                    ServerOp::Info(new_info) => {
+                        // Server may resend INFO after TLS upgrade.
+                        if !new_info.connect_urls.is_empty() {
+                            inner.borrow_mut().known_servers = new_info.connect_urls;
+                        }
+                    }
+                    ServerOp::Err(msg) => {
+                        if is_permanent_auth_error(&msg) {
+                            // Permanent failure — no point retrying.
+                            inner.borrow_mut().close_error = Some(msg);
+                            return None;
+                        }
+                        break 'pong;
+                    }
+                    _ => break 'pong,
                 }
-            }
-            if got_pong {
-                break;
             }
         }
         if !got_pong {
             continue;
         }
 
-        // Re-subscribe.
+        // Re-subscribe all live subscriptions on the new connection.
         let subs: Vec<(String, SubInfo)> = {
             let inner = inner.borrow();
             inner
@@ -1040,6 +1165,17 @@ async fn attempt_reconnect(
     }
 
     None
+}
+
+/// Returns `true` for -ERR messages that indicate a permanent authentication
+/// failure that no amount of reconnecting will fix.
+fn is_permanent_auth_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("authorization violation")
+        || m.contains("authentication expired")
+        || m.contains("authentication revoked")
+        || m.contains("user authentication expired")
+        || m.contains("user authentication revoked")
 }
 
 // ── Dispatch & helpers ─────────────────────────────────────────────
@@ -1083,7 +1219,13 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
                 w.wake();
             }
         }
-        ServerOp::Ok | ServerOp::Info(_) => {}
+        ServerOp::Ok => {}
+        ServerOp::Info(new_info) => {
+            // Update known cluster nodes when server pushes topology changes.
+            if !new_info.connect_urls.is_empty() {
+                inner.borrow_mut().known_servers = new_info.connect_urls;
+            }
+        }
         ServerOp::Err(msg) => {
             let mut inner = inner.borrow_mut();
             inner.closed = true;
@@ -1095,7 +1237,12 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
 
 fn deliver(inner: &Rc<RefCell<Inner>>, sid: &str, message: Message) {
     let mut inner = inner.borrow_mut();
+    let capacity = inner.mailbox_capacity;
     if let Some(mailbox) = inner.mailboxes.get_mut(sid) {
+        // Slow-consumer protection: drop the oldest message when at capacity.
+        if mailbox.queue.len() >= capacity {
+            mailbox.queue.pop_front();
+        }
         mailbox.queue.push_back(message);
         if let Some(w) = mailbox.waker.take() {
             w.wake();

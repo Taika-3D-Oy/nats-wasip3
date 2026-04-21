@@ -24,8 +24,8 @@
 //!     --env NATS_URL=127.0.0.1:14222 --env NATS_TLS_URL=127.0.0.1:4223 \
 //!     target/wasm32-wasip3/debug/examples/integration_tests.wasm
 
-use nats_wasip3::client::{Client, ConnectConfig, Message, secs, millis, with_timeout};
-use nats_wasip3::proto::Headers;
+use nats_wasip3::{Client, ConnectConfig, Headers, secs, millis, with_timeout};
+use nats_wasip3::client::Message;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -1382,6 +1382,295 @@ async fn test_object_store_open_existing() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  Connection control: flush, explicit unsubscribe
+// ══════════════════════════════════════════════════════════════════
+
+async fn test_client_flush() {
+    let client = connect().await;
+    // A flush against a healthy server must complete well under 2 s.
+    client.flush(secs(2)).await.unwrap();
+    // After publishing, flush should still succeed.
+    client.publish("test.flush.x", b"x").unwrap();
+    client.flush(secs(2)).await.unwrap();
+}
+
+async fn test_subscription_explicit_unsubscribe() {
+    let client = connect().await;
+    let sub = client.subscribe("test.unsub.explicit").unwrap();
+    client.publish("test.unsub.explicit", b"first").unwrap();
+    let m = sub.next().await.unwrap();
+    assert_payload(&m, b"first");
+
+    // Explicit unsubscribe (without dropping).
+    sub.unsubscribe();
+    // Allow UNSUB to flush.
+    wasip3::clocks::monotonic_clock::wait_for(millis(100)).await;
+
+    // A new subscription should only see new messages.
+    let sub2 = client.subscribe("test.unsub.explicit").unwrap();
+    client.publish("test.unsub.explicit", b"after").unwrap();
+    let m2 = sub2.next().await.unwrap();
+    assert_payload(&m2, b"after");
+}
+
+async fn test_subscription_unsubscribe_after() {
+    let client = connect().await;
+    let sub = client.subscribe("test.unsub.after").unwrap();
+    sub.unsubscribe_after(2);
+
+    client.publish("test.unsub.after", b"a").unwrap();
+    client.publish("test.unsub.after", b"b").unwrap();
+    client.publish("test.unsub.after", b"c").unwrap();
+    client.publish("test.unsub.after", b"d").unwrap();
+
+    let m1 = sub.next().await.unwrap();
+    assert_payload(&m1, b"a");
+    let m2 = sub.next().await.unwrap();
+    assert_payload(&m2, b"b");
+
+    // Server should have auto-unsubscribed; the third message must time out.
+    let r3 = with_timeout(millis(500), sub.next()).await;
+    assert!(matches!(r3, Err(nats_wasip3::Error::Timeout)));
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  KV: per-message TTL, status, watch from non-zero seq
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "kv")]
+async fn test_kv_put_with_ttl() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_ttl").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "ttl".into(),
+            allow_msg_ttl: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // 2 s TTL.
+    kv.put_with_ttl("ephemeral", b"v", secs(2)).await.unwrap();
+    let entry = kv.get("ephemeral").await.unwrap().expect("exists initially");
+    assert_eq!(entry.value, b"v");
+
+    // Wait past expiry. Server enforces TTL with 1-s precision; pad generously.
+    wasip3::clocks::monotonic_clock::wait_for(secs(4)).await;
+
+    let gone = kv.get("ephemeral").await.unwrap();
+    assert!(gone.is_none(), "expected key to expire after TTL");
+
+    js.delete_stream("KV_ttl").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_status() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_status").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "status".into(),
+            history: 5,
+            allow_msg_ttl: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    kv.put("a", b"1").await.unwrap();
+    kv.put("b", b"22").await.unwrap();
+
+    let st = kv.status().await.unwrap();
+    assert_eq!(st.bucket, "status");
+    assert_eq!(st.values, 2, "should report 2 live values");
+    assert!(st.bytes > 0);
+    assert_eq!(st.history, 5);
+    assert!(st.allow_msg_ttl);
+    assert!(st.last_seq >= 2);
+
+    js.delete_stream("KV_status").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_watch_from_seq() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig, Operation};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_watchseq").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "watchseq".into(),
+            history: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let r1 = kv.put("k", b"1").await.unwrap();
+    let _r2 = kv.put("k", b"2").await.unwrap();
+    let r3 = kv.put("k", b"3").await.unwrap();
+
+    // Start watching from seq r1+1 — we should see r2 and r3 only.
+    let watcher = kv.watch(r1 + 1).await.unwrap();
+
+    let e2 = watcher.next().await.unwrap();
+    assert_eq!(e2.value, b"2");
+    assert_eq!(e2.operation, Operation::Put);
+
+    let e3 = watcher.next().await.unwrap();
+    assert_eq!(e3.value, b"3");
+    assert_eq!(e3.revision, r3);
+
+    js.delete_stream("KV_watchseq").await.unwrap();
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  JetStream: purge_stream_subject, max_msgs_per_subject
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "jetstream")]
+async fn test_jetstream_purge_subject() {
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("PURGESUB").await;
+
+    js.create_stream(&StreamConfig {
+        name: "PURGESUB".into(),
+        subjects: vec!["purgesub.>".into()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    js.publish("purgesub.a", b"a1").await.unwrap();
+    js.publish("purgesub.a", b"a2").await.unwrap();
+    js.publish("purgesub.b", b"b1").await.unwrap();
+
+    let purge = js.purge_stream_subject("PURGESUB", "purgesub.a").await.unwrap();
+    assert!(purge.success);
+    assert_eq!(purge.purged, 2);
+
+    let info = js.stream_info("PURGESUB").await.unwrap();
+    assert_eq!(info.state.messages, 1, "only purgesub.b should remain");
+
+    js.delete_stream("PURGESUB").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_jetstream_max_msgs_per_subject() {
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("MAXSUBJ").await;
+
+    js.create_stream(&StreamConfig {
+        name: "MAXSUBJ".into(),
+        subjects: vec!["maxsubj.>".into()],
+        max_msgs_per_subject: 2,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Publish 4 messages on the same subject; only the last 2 should survive.
+    for i in 0..4 {
+        js.publish("maxsubj.x", format!("v{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    let info = js.stream_info("MAXSUBJ").await.unwrap();
+    assert_eq!(info.state.messages, 2, "max_msgs_per_subject=2 should cap retention");
+    assert_eq!(info.config.max_msgs_per_subject, 2);
+
+    js.delete_stream("MAXSUBJ").await.unwrap();
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Object store: digest verification (corruption rejection)
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_digest_mismatch() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_digest").await;
+
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "digest".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let info = store.put("file.bin", b"original-data").await.unwrap();
+    assert!(info.digest.as_deref().unwrap_or("").starts_with("SHA-256="));
+
+    // Inject a corrupted chunk on the same chunk subject — its content won't
+    // match the stored SHA-256.
+    let chunk_subject = format!("$O.digest.C.{}", info.nuid);
+    js.publish(&chunk_subject, b"tampered").await.unwrap();
+
+    // Wipe the original chunk(s) so reassembly picks up the tampered one.
+    let _ = js.purge_stream_subject(
+        "OBJ_digest",
+        &format!("$O.digest.C.{}", info.nuid),
+    ).await;
+    // Republish a single corrupted chunk under the same subject.
+    js.publish(&chunk_subject, b"tampered").await.unwrap();
+
+    let result = store.get("file.bin").await;
+    // Either size mismatch or digest mismatch is acceptable evidence that
+    // verification rejected the corrupted object.
+    match result {
+        Err(nats_wasip3::Error::Protocol(msg)) => {
+            assert!(
+                msg.contains("digest mismatch") || msg.contains("size mismatch"),
+                "expected digest/size mismatch error, got: {msg}",
+            );
+        }
+        other => panic!("expected Protocol error, got {other:?}"),
+    }
+
+    js.delete_stream("OBJ_digest").await.unwrap();
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  TLS tests
 // ══════════════════════════════════════════════════════════════════
 
@@ -1581,6 +1870,9 @@ async fn run_tests() {
     run_test!("test_concurrent_subscriptions_same_subject", test_concurrent_subscriptions_same_subject().await);
     run_test!("test_publish_max_payload_boundary", test_publish_max_payload_boundary().await);
     run_test!("test_connect_dns_hostname", test_connect_dns_hostname().await);
+    run_test!("test_client_flush", test_client_flush().await);
+    run_test!("test_subscription_explicit_unsubscribe", test_subscription_explicit_unsubscribe().await);
+    run_test!("test_subscription_unsubscribe_after", test_subscription_unsubscribe_after().await);
 
     // ── JetStream ──────────────────────────────────────────────
     #[cfg(feature = "jetstream")]
@@ -1594,6 +1886,8 @@ async fn run_tests() {
         run_test!("test_jetstream_fetch_empty_stream", test_jetstream_fetch_empty_stream().await);
         run_test!("test_jetstream_publish_dedup", test_jetstream_publish_dedup().await);
         run_test!("test_jetstream_stream_info_not_found", test_jetstream_stream_info_not_found().await);
+        run_test!("test_jetstream_purge_subject", test_jetstream_purge_subject().await);
+        run_test!("test_jetstream_max_msgs_per_subject", test_jetstream_max_msgs_per_subject().await);
     }
 
     // ── KV ─────────────────────────────────────────────────────
@@ -1608,6 +1902,9 @@ async fn run_tests() {
         run_test!("test_kv_update_wrong_revision", test_kv_update_wrong_revision().await);
         run_test!("test_kv_put_overwrite", test_kv_put_overwrite().await);
         run_test!("test_kv_delete_then_create", test_kv_delete_then_create().await);
+        run_test!("test_kv_status", test_kv_status().await);
+        run_test!("test_kv_watch_from_seq", test_kv_watch_from_seq().await);
+        run_test!("test_kv_put_with_ttl", test_kv_put_with_ttl().await);
     }
 
     // ── Object Store ───────────────────────────────────────────
@@ -1621,6 +1918,7 @@ async fn run_tests() {
         run_test!("test_object_store_info", test_object_store_info().await);
         run_test!("test_object_store_status", test_object_store_status().await);
         run_test!("test_object_store_open_existing", test_object_store_open_existing().await);
+        run_test!("test_object_store_digest_mismatch", test_object_store_digest_mismatch().await);
     }
 
     // ── TLS ────────────────────────────────────────────────────

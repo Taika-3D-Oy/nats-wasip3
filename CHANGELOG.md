@@ -2,6 +2,65 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] – 2026-04-21
+
+### Added
+
+**Authentication**
+- `ConnectConfig::jwt` — bare JWT for NATS 2.0 operator authentication.
+- `ConnectConfig::credentials` (`nkey` feature) — parse a standard NATS `.creds`
+  file (JWT + NKey seed blocks); overrides `jwt` / `nkey_seed`.
+
+**Multi-server & cluster failover**
+- `ConnectConfig::servers: Vec<String>` — additional server addresses tried on
+  connect and on every reconnect attempt, round-robined with `address`.
+- Cluster node URLs from server `INFO.connect_urls` are stored and added to the
+  reconnect candidate pool automatically (live topology discovery).
+- TLS SNI is now derived from the current candidate address rather than always
+  using `config.address`.
+
+**Slow-consumer protection**
+- `ConnectConfig::subscription_capacity: usize` (default 512) — maximum pending
+  messages per subscription mailbox. When the mailbox is full the oldest message
+  is dropped (drop-head policy, matching the Go client).
+
+**Write-buffer back-pressure**
+- `ConnectConfig::max_pending_write_bytes: usize` (default 8 MiB) — publish/
+  subscribe calls return `Err(Error::BufferFull)` when the outbound buffer
+  exceeds this limit.
+- `Error::BufferFull` variant added.
+
+**Object Store**
+- SHA-256 digest computed on `put`; stored as `"SHA-256=<base64url-no-pad>"`
+  in object metadata per the NATS spec. Verified on `get` — a mismatch returns
+  `Err(Error::Protocol("object digest mismatch …"))`.
+- `ObjectInfo::digest: Option<String>` exposed publicly.
+
+**API**
+- `Client`, `ConnectConfig`, `Headers`, `ServerInfo`, `Message`, `Subscription`,
+  `millis`, `secs`, `with_timeout` re-exported from the crate root — no more
+  `use nats_wasip3::client::…` or `use nats_wasip3::proto::…` required.
+- `proto` module is now `pub(crate)` — internal wire types (`ServerOp`, `Msg`,
+  `HMsg`, `ConnectOptions`) are no longer part of the public API.
+- `#[non_exhaustive]` added to all output/receive types (`Error`, `Message`,
+  `StreamInfo`, `StreamState`, `PubAck`, `ConsumerInfo`, `PurgeResponse`,
+  `KvStatus`, `Entry`, `Object`, `ObjectInfo`, `ObjectStoreStatus`) and all
+  server-facing enums (`Storage`, `Retention`, `DiscardPolicy`, `DeliverPolicy`,
+  `ReplayPolicy`, `AckPolicy`, `Operation`).
+- `[package.metadata.docs.rs]` added: `all-features = true` for docs.rs builds.
+
+**Reconnect**
+- Permanent server auth errors (`Authorization Violation`, `Authentication
+  Expired/Revoked`) now abort reconnection immediately instead of exhausting the
+  full retry budget.
+
+### Breaking
+- `nats_wasip3::proto` is no longer public. Replace:
+  - `use nats_wasip3::proto::Headers` → `use nats_wasip3::Headers`
+  - `use nats_wasip3::client::{Client, ConnectConfig, …}` → `use nats_wasip3::{Client, ConnectConfig, …}`
+- All output types and enums are now `#[non_exhaustive]`. Exhaustive `match`
+  arms over `Error`, `AckPolicy`, `Operation`, etc. must add a wildcard arm.
+
 ## [0.6.0] – 2026-04-21
 
 ### Added

@@ -26,6 +26,7 @@ pub struct KeyValue {
 }
 
 /// Runtime status / statistics for a KV bucket.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct KvStatus {
     pub bucket: String,
@@ -44,6 +45,7 @@ pub struct KvStatus {
 }
 
 /// A KV entry.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct Entry {
     pub key: String,
@@ -52,6 +54,7 @@ pub struct Entry {
     pub operation: Operation,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
     Put,

@@ -6,7 +6,7 @@
 //! cargo build --example pubsub --target wasm32-wasip3
 //! ```
 
-use nats_wasip3::client::{Client, ConnectConfig};
+use nats_wasip3::{Client, ConnectConfig};
 
 wasip3::cli::command::export!(PubSub);
 

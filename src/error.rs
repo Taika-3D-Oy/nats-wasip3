@@ -4,6 +4,7 @@ use wasip3::sockets::types::ErrorCode;
 use wasip3::sockets::ip_name_lookup::ErrorCode as DnsErrorCode;
 
 /// Errors returned by nats-wasi operations.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
     /// I/O error from the standard library.
@@ -22,6 +23,9 @@ pub enum Error {
     NoResponders,
     /// Connection is closed.
     Disconnected,
+    /// The client's outbound write buffer is full (server is too slow).
+    /// The message was NOT sent. Either drain pending messages or close.
+    BufferFull,
     /// JSON serialization/deserialization error.
     Json(String),
     /// JetStream API error.
@@ -50,6 +54,7 @@ impl fmt::Display for Error {
             Error::Timeout => write!(f, "timeout"),
             Error::NoResponders => write!(f, "no responders"),
             Error::Disconnected => write!(f, "disconnected"),
+            Error::BufferFull => write!(f, "write buffer full"),
             Error::Json(msg) => write!(f, "json: {msg}"),
             #[cfg(feature = "jetstream")]
             Error::JetStream { code, description } => {
