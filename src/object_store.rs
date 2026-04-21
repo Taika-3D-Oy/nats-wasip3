@@ -121,7 +121,7 @@ impl ObjectStore {
             js,
             bucket: config.bucket,
             stream_name,
-            max_chunk_size: config.max_chunk_size.max(1),
+            max_chunk_size: config.max_chunk_size,
         })
     }
 
@@ -158,7 +158,7 @@ impl ObjectStore {
         }
 
         let old = self.get_meta(name).await?;
-        let nuid = next_chunk_id();
+        let nuid = next_nuid();
         let chunk_subject = self.chunk_subject(&nuid);
 
         let mut chunk_count: u32 = 0;
@@ -173,7 +173,7 @@ impl ObjectStore {
             nuid: nuid.clone(),
             size: data.len() as u64,
             chunks: chunk_count,
-            mtime: now_nanos_timestamp(),
+            mtime: now_nanos_timestamp()?,
             deleted: false,
             options: Some(ObjectMetaOptions {
                 max_chunk_size: Some(chunk_size),
@@ -211,8 +211,13 @@ impl ObjectStore {
             .create_consumer(&self.stream_name, &consumer_cfg)
             .await?;
 
-        let batch = if meta.chunks == 0 { 1 } else { meta.chunks };
-        let msgs = self.js.fetch(&self.stream_name, &info.name, batch).await?;
+        let msgs = if meta.chunks == 0 {
+            Vec::new()
+        } else {
+            self.js
+                .fetch(&self.stream_name, &info.name, meta.chunks)
+                .await?
+        };
         let mut out = Vec::with_capacity(meta.size as usize);
         for msg in msgs {
             out.extend_from_slice(&msg.payload);
@@ -280,7 +285,7 @@ impl ObjectStore {
             nuid: meta.nuid,
             size: 0,
             chunks: 0,
-            mtime: now_nanos_timestamp(),
+            mtime: now_nanos_timestamp()?,
             deleted: true,
             options: meta.options,
         };
@@ -395,7 +400,7 @@ fn meta_to_info(meta: ObjectMeta) -> ObjectInfo {
     }
 }
 
-fn next_chunk_id() -> String {
+fn next_nuid() -> String {
     let id = NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
     format!("O{id:016x}")
 }
@@ -405,12 +410,12 @@ fn name_to_subject_token(name: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(name.as_bytes())
 }
 
-fn now_nanos_timestamp() -> String {
+fn now_nanos_timestamp() -> Result<String, Error> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos}")
+        .map_err(|e| Error::Protocol(format!("system time before unix epoch: {e}")))?
+        .as_nanos();
+    Ok(format!("{nanos}"))
 }
 
 #[cfg(test)]
@@ -424,8 +429,8 @@ mod tests {
 
     #[test]
     fn chunk_id_monotonic() {
-        let a = next_chunk_id();
-        let b = next_chunk_id();
+        let a = next_nuid();
+        let b = next_nuid();
         assert!(b > a);
     }
 }
