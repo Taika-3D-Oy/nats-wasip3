@@ -53,17 +53,44 @@ impl Subscription {
         }
         .await
     }
+
+    /// Unsubscribe immediately. Equivalent to dropping the subscription, but
+    /// explicit and does not require ownership.
+    pub fn unsubscribe(&self) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mailboxes.remove(&self.sid).is_none() {
+            return; // already unsubscribed
+        }
+        inner.subscriptions.remove(&self.sid);
+        let unsub = proto::encode_unsub(&self.sid, None);
+        inner.write_buf.extend_from_slice(&unsub);
+        if let Some(w) = inner.flush_waker.take() {
+            w.wake();
+        }
+    }
+
+    /// Ask the server to deliver at most `max_msgs` more messages, then
+    /// automatically unsubscribe. Useful for request-after-subscribe patterns.
+    pub fn unsubscribe_after(&self, max_msgs: u64) {
+        let unsub = proto::encode_unsub(&self.sid, Some(max_msgs));
+        let mut inner = self.inner.borrow_mut();
+        inner.write_buf.extend_from_slice(&unsub);
+        if let Some(w) = inner.flush_waker.take() {
+            w.wake();
+        }
+    }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
-        inner.mailboxes.remove(&self.sid);
+        // If unsubscribe() was called explicitly, mailbox is already gone.
+        if inner.mailboxes.remove(&self.sid).is_none() {
+            return;
+        }
         inner.subscriptions.remove(&self.sid);
         let unsub = proto::encode_unsub(&self.sid, None);
         inner.write_buf.extend_from_slice(&unsub);
-        // Wake the flush loop so the UNSUB is sent promptly rather than
-        // sitting in write_buf until the next user publish/subscribe.
         if let Some(w) = inner.flush_waker.take() {
             w.wake();
         }
@@ -94,6 +121,11 @@ pub struct ConnectConfig {
     pub tls: bool,
     #[cfg(feature = "tls")]
     pub tls_server_name: Option<String>,
+    /// NKey seed string (starts with `S`). When set, the server's nonce is
+    /// signed with this key and `sig` + `nkey` are sent in CONNECT.
+    /// Requires the `nkey` feature.
+    #[cfg(feature = "nkey")]
+    pub nkey_seed: Option<String>,
     /// Maximum reconnection attempts. `0` disables reconnection. Default: `5`.
     pub max_reconnect_attempts: u32,
     /// Base reconnection delay (nanoseconds, doubles each attempt, cap 8 s). Default: 250 ms.
@@ -111,6 +143,8 @@ impl Default for ConnectConfig {
             tls: false,
             #[cfg(feature = "tls")]
             tls_server_name: None,
+            #[cfg(feature = "nkey")]
+            nkey_seed: None,
             max_reconnect_attempts: 5,
             reconnect_delay: millis(250),
         }
@@ -135,6 +169,8 @@ struct Inner {
     subscriptions: HashMap<String, SubInfo>,
     write_buf: Vec<u8>,
     flush_waker: Option<Waker>,
+    /// Woken when a PONG arrives — used by Client::flush().
+    pong_waker: Option<Waker>,
     next_id: u64,
     closed: bool,
     close_error: Option<String>,
@@ -244,14 +280,7 @@ impl Client {
         };
 
         // ── Send CONNECT + PING ────────────────────────────────
-        let connect_opts = ConnectOptions {
-            name: config.name.clone(),
-            user: config.user.clone(),
-            pass: config.pass.clone(),
-            auth_token: config.auth_token.clone(),
-            tls_required: use_tls,
-            ..Default::default()
-        };
+        let connect_opts = build_connect_opts(&config, &info, use_tls)?;
         let mut handshake = proto::encode_connect(&connect_opts);
         handshake.extend_from_slice(proto::PING);
         stream_write_all(&mut tx, &handshake).await?;
@@ -280,6 +309,7 @@ impl Client {
             subscriptions: HashMap::new(),
             write_buf: Vec::new(),
             flush_waker: None,
+            pong_waker: None,
             next_id: 1,
             closed: false,
             close_error: None,
@@ -523,6 +553,22 @@ impl Client {
         wake_all(&mut inner);
     }
 
+    /// Flush pending writes and wait for a PONG from the server, confirming
+    /// that all previously published messages have been received.
+    /// Returns `Err(Error::Timeout)` if the server doesn't respond within `timeout`.
+    pub async fn flush(&self, timeout: Duration) -> Result<(), Error> {
+        self.check_closed()?;
+        // Enqueue a PING — server will echo back PONG once it processes everything.
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.write_buf.extend_from_slice(proto::PING);
+            if let Some(w) = inner.flush_waker.take() {
+                w.wake();
+            }
+        }
+        with_timeout(timeout, PongWait { inner: &self.inner, registered: false }).await?
+    }
+
     fn next_sid(&self) -> String {
         let mut inner = self.inner.borrow_mut();
         let id = inner.next_id;
@@ -561,8 +607,38 @@ pub async fn with_timeout<F: Future>(timeout: Duration, future: F) -> Result<F::
 
 // ── P3 stream I/O helpers ──────────────────────────────────────────
 
+/// Build a `ConnectOptions` from config + server INFO, signing the nonce
+/// with an NKey if `nkey_seed` is set.
+fn build_connect_opts(
+    config: &ConnectConfig,
+    _info: &proto::ServerInfo,
+    use_tls: bool,
+) -> Result<ConnectOptions, Error> {
+    #[cfg_attr(not(feature = "nkey"), allow(unused_mut))]
+    let mut opts = ConnectOptions {
+        name: config.name.clone(),
+        user: config.user.clone(),
+        pass: config.pass.clone(),
+        auth_token: config.auth_token.clone(),
+        tls_required: use_tls,
+        ..Default::default()
+    };
+
+    #[cfg(feature = "nkey")]
+    if let Some(ref seed) = config.nkey_seed {
+        let kp = crate::nkey::KeyPair::from_seed(seed)?;
+        let nonce = _info
+            .nonce
+            .as_deref()
+            .ok_or_else(|| Error::Protocol("server did not send nonce for nkey auth".into()))?;
+        opts.sig = Some(kp.sign(nonce.as_bytes()));
+        opts.nkey = Some(kp.public_key());
+    }
+
+    Ok(opts)
+}
+
 /// Parse "host:port" into a P3 `IpSocketAddress`.
-/// If the host is not a literal IP address, performs DNS resolution via WASI.
 async fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
     let (host, port_str) = addr
         .rsplit_once(':')
@@ -685,6 +761,40 @@ impl Future for RequestFuture {
     }
 }
 
+struct PongWait<'a> {
+    inner: &'a Rc<RefCell<Inner>>,
+    /// Tracks whether we've installed the waker in `inner.pong_waker` yet.
+    registered: bool,
+}
+
+impl<'a> Future for PongWait<'a> {
+    type Output = Result<(), Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.closed {
+            return Poll::Ready(Err(match &inner.close_error {
+                Some(msg) => Error::Server(msg.clone()),
+                None => Error::Disconnected,
+            }));
+        }
+        if self.registered {
+            // We've already installed the waker. If dispatch_op fired it,
+            // pong_waker is now None — that means the PONG has arrived.
+            if inner.pong_waker.is_none() {
+                return Poll::Ready(Ok(()));
+            }
+            // Spurious wakeup — update the waker in case it changed.
+            inner.pong_waker = Some(cx.waker().clone());
+        } else {
+            // First poll: install our waker and wait.
+            inner.pong_waker = Some(cx.waker().clone());
+            self.registered = true;
+        }
+        Poll::Pending
+    }
+}
+
 // ── Background read loop ───────────────────────────────────────────
 
 async fn read_loop(
@@ -776,6 +886,11 @@ async fn attempt_reconnect(
             return None;
         }
         delay = if delay + delay < cap { delay + delay } else { cap };
+        // Add ±25% jitter to spread out reconnection storms.
+        // Use a simple deterministic mix derived from the current delay value.
+        let jitter_range = delay / 4;
+        let jitter_offset = (delay.wrapping_mul(0x9e3779b97f4a7c15) >> 32) % jitter_range.max(1);
+        delay = delay.saturating_sub(jitter_range / 2).saturating_add(jitter_offset);
 
         let sock_addr = match parse_address(&config.address).await {
             Ok(a) => a,
@@ -846,13 +961,9 @@ async fn attempt_reconnect(
         };
 
         // CONNECT + PING.
-        let connect_opts = ConnectOptions {
-            name: config.name.clone(),
-            user: config.user.clone(),
-            pass: config.pass.clone(),
-            auth_token: config.auth_token.clone(),
-            tls_required: use_tls,
-            ..Default::default()
+        let connect_opts = match build_connect_opts(config, &info, use_tls) {
+            Ok(o) => o,
+            Err(_) => continue,
         };
         let mut hdata = proto::encode_connect(&connect_opts);
         hdata.extend_from_slice(proto::PING);
@@ -966,7 +1077,13 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
                 w.wake();
             }
         }
-        ServerOp::Pong | ServerOp::Ok | ServerOp::Info(_) => {}
+        ServerOp::Pong => {
+            // Wake any pending flush() call waiting for the PONG.
+            if let Some(w) = inner.borrow_mut().pong_waker.take() {
+                w.wake();
+            }
+        }
+        ServerOp::Ok | ServerOp::Info(_) => {}
         ServerOp::Err(msg) => {
             let mut inner = inner.borrow_mut();
             inner.closed = true;
@@ -993,6 +1110,9 @@ fn wake_all(inner: &mut Inner) {
         }
     }
     if let Some(w) = inner.flush_waker.take() {
+        w.wake();
+    }
+    if let Some(w) = inner.pong_waker.take() {
         w.wake();
     }
 }

@@ -409,6 +409,20 @@ impl ConsumerMessages {
     }
 }
 
+impl Drop for ConsumerMessages {
+    fn drop(&mut self) {
+        // Fire-and-forget ephemeral consumer cleanup. Requires a reply-to so
+        // the JetStream server actually processes the DELETE; we never read
+        // the reply.
+        let subject = format!(
+            "$JS.API.CONSUMER.DELETE.{}.{}",
+            self.stream, self.consumer
+        );
+        let inbox = self.client.new_inbox();
+        let _ = self.client.publish_with_reply(&subject, &inbox, b"");
+    }
+}
+
 /// A message received from a JetStream push consumer. Must be acknowledged.
 pub struct JsMessage {
     /// The underlying NATS message.

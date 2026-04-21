@@ -25,6 +25,24 @@ pub struct KeyValue {
     stream_name: String,
 }
 
+/// Runtime status / statistics for a KV bucket.
+#[derive(Debug)]
+pub struct KvStatus {
+    pub bucket: String,
+    /// Number of live (non-deleted) entries.
+    pub values: u64,
+    /// Total bytes stored in the backing stream.
+    pub bytes: u64,
+    /// History depth (max revisions per key).
+    pub history: i64,
+    /// Bucket-wide TTL in nanoseconds, if configured.
+    pub ttl: Option<Duration>,
+    /// Whether per-message TTL is enabled.
+    pub allow_msg_ttl: bool,
+    /// Stream sequence of the last message.
+    pub last_seq: u64,
+}
+
 /// A KV entry.
 #[derive(Debug)]
 pub struct Entry {
@@ -402,6 +420,20 @@ impl KeyValue {
             .collect())
     }
 
+    /// Return runtime status / statistics for this bucket.
+    pub async fn status(&self) -> Result<KvStatus, Error> {
+        let info = self.js.stream_info(&self.stream_name).await?;
+        Ok(KvStatus {
+            bucket: self.bucket.clone(),
+            values: info.state.messages,
+            bytes: info.state.bytes,
+            history: info.config.max_msgs_per_subject,
+            ttl: info.config.max_age,
+            allow_msg_ttl: info.config.allow_msg_ttl,
+            last_seq: info.state.last_seq,
+        })
+    }
+
     /// Access the underlying JetStream context.
     pub fn jetstream(&self) -> &JetStream {
         &self.js
@@ -453,7 +485,7 @@ impl KeyValue {
             ..Default::default()
         };
 
-        let _info = self
+        let info = self
             .js
             .create_consumer(&self.stream_name, &consumer_cfg)
             .await?;
@@ -463,7 +495,13 @@ impl KeyValue {
 
         let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
 
-        Ok(KvWatcher { sub, prefix })
+        Ok(KvWatcher {
+            sub,
+            prefix,
+            js: self.js.clone(),
+            stream_name: self.stream_name.clone(),
+            consumer_name: info.name,
+        })
     }
 }
 
@@ -471,6 +509,25 @@ impl KeyValue {
 pub struct KvWatcher {
     sub: crate::client::Subscription,
     prefix: String,
+    /// Held so Drop can delete the ephemeral consumer.
+    js: crate::jetstream::JetStream,
+    stream_name: String,
+    consumer_name: String,
+}
+
+impl Drop for KvWatcher {
+    fn drop(&mut self) {
+        // Fire-and-forget consumer deletion. JetStream API calls require a
+        // reply-to subject — we use a throwaway inbox. The server will send
+        // a response there but we never subscribe to it; the consumer is
+        // still deleted.
+        let subject = format!(
+            "$JS.API.CONSUMER.DELETE.{}.{}",
+            self.stream_name, self.consumer_name
+        );
+        let inbox = self.js.client().new_inbox();
+        let _ = self.js.client().publish_with_reply(&subject, &inbox, b"");
+    }
 }
 
 impl KvWatcher {
