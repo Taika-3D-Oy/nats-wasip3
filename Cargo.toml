@@ -2,7 +2,7 @@
 
 [package]
 name = "nats-wasip3"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "NATS client for wasm32-wasip3 — native Component Model async I/O"
 license = "Apache-2.0"

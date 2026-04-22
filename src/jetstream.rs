@@ -286,6 +286,8 @@ impl JetStream {
             data: Option<String>, // base64
             #[serde(default)]
             hdrs: Option<String>, // base64 encoded NATS headers
+            #[serde(default)]
+            time: Option<String>, // RFC 3339 server-side timestamp
         }
 
         let resp: MsgGetResp = serde_json::from_slice(&reply.payload)?;
@@ -310,6 +312,7 @@ impl JetStream {
             seq: wire.seq,
             data,
             headers_b64: wire.hdrs,
+            time: wire.time,
         }))
     }
 
@@ -491,6 +494,37 @@ impl JsMessage {
             self.client.publish(reply, b"+TERM")?;
         }
         Ok(())
+    }
+
+    /// Server-side publish timestamp as an RFC 3339 string
+    /// (e.g. `"2024-01-15T12:34:56.789Z"`), taken from the `Nats-Time-Stamp`
+    /// header that JetStream adds to every delivered message.
+    ///
+    /// Returns `None` if the header is absent (non-JetStream messages,
+    /// or very old server versions).
+    pub fn timestamp(&self) -> Option<&str> {
+        self.message.headers.as_ref()?.get("Nats-Time-Stamp")
+    }
+
+    /// Server-side publish timestamp as **nanoseconds since the Unix epoch**,
+    /// parsed from the JetStream ACK reply-to subject that NATS embeds in
+    /// every push-consumer delivery.
+    ///
+    /// Returns `None` if the reply-to subject is absent or has an unexpected
+    /// format (e.g. a plain pub/sub message not delivered via JetStream).
+    pub fn timestamp_nanos(&self) -> Option<u64> {
+        let reply = self.reply_to.as_deref()?;
+        let tokens: Vec<&str> = reply.split('.').collect();
+        // v1: $JS.ACK.<stream>.<consumer>.<del>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>
+        //     9 tokens — timestamp at index 7
+        // v2: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<del>.<ss>.<cs>.<ts_nanos>.<pending>.<token>
+        //     12 tokens — timestamp at index 9
+        let idx = match tokens.len() {
+            9 => 7,
+            12 => 9,
+            _ => return None,
+        };
+        tokens.get(idx)?.parse().ok()
     }
 }
 
@@ -697,6 +731,9 @@ pub struct StreamMessage {
     pub data: Vec<u8>,
     /// Raw base64-encoded NATS headers (if present).
     pub headers_b64: Option<String>,
+    /// Server-side publish timestamp in RFC 3339 format
+    /// (e.g. `"2024-01-15T12:34:56.789456789Z"`), as returned by the server.
+    pub time: Option<String>,
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

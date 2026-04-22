@@ -186,7 +186,7 @@ impl ObjectStore {
             nuid: nuid.clone(),
             size: data.len() as u64,
             chunks: chunk_count,
-            mtime: now_nanos_timestamp()?,
+            mtime: now_rfc3339()?,
             deleted: false,
             digest: Some(digest),
             options: Some(ObjectMetaOptions {
@@ -318,7 +318,7 @@ impl ObjectStore {
             nuid: meta.nuid,
             size: 0,
             chunks: 0,
-            mtime: now_nanos_timestamp()?,
+            mtime: now_rfc3339()?,
             deleted: true,
             digest: None,
             options: meta.options,
@@ -457,9 +457,40 @@ fn name_to_subject_token(name: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(name.as_bytes())
 }
 
-fn now_nanos_timestamp() -> Result<String, Error> {
-    let nanos = now_unix_nanos()?;
-    Ok(format!("{nanos}"))
+fn now_rfc3339() -> Result<String, Error> {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Protocol(format!("system time before unix epoch: {e}")))?;
+    Ok(format_rfc3339(d.as_secs(), d.subsec_nanos()))
+}
+
+fn format_rfc3339(secs: u64, nanos: u32) -> String {
+    let (year, month, day, hour, min, sec) = unix_secs_to_datetime(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{nanos:09}Z")
+}
+
+/// Convert seconds since Unix epoch to (year, month, day, hour, min, sec).
+/// Uses Howard Hinnant's civil-from-days algorithm.
+fn unix_secs_to_datetime(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let sec = secs % 60;
+    let mins = secs / 60;
+    let min = mins % 60;
+    let hours = mins / 60;
+    let hour = hours % 24;
+    let days = hours / 24;
+
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    (year, month, day, hour, min, sec)
 }
 
 fn now_unix_nanos() -> Result<u128, Error> {
@@ -483,5 +514,19 @@ mod tests {
         let a = generate_chunk_subject_id().unwrap();
         let b = generate_chunk_subject_id().unwrap();
         assert!(b > a);
+    }
+
+    #[test]
+    fn rfc3339_unix_epoch() {
+        assert_eq!(format_rfc3339(0, 0), "1970-01-01T00:00:00.000000000Z");
+    }
+
+    #[test]
+    fn rfc3339_known_timestamp() {
+        // 2024-04-22T00:00:00Z = 1713744000 seconds since epoch
+        assert_eq!(
+            format_rfc3339(1_713_744_000, 123_456_789),
+            "2024-04-22T00:00:00.123456789Z"
+        );
     }
 }

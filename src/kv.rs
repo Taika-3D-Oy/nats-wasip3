@@ -52,6 +52,10 @@ pub struct Entry {
     pub value: Vec<u8>,
     pub revision: u64,
     pub operation: Operation,
+    /// Server-side publish timestamp in RFC 3339 format
+    /// (e.g. `"2024-01-15T12:34:56.789Z"`), as returned by the server.
+    /// `None` if the server did not supply a timestamp.
+    pub time: Option<String>,
 }
 
 #[non_exhaustive]
@@ -171,6 +175,12 @@ impl KeyValue {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
+        let time = reply
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("Nats-Time-Stamp"))
+            .map(str::to_string);
+
         let operation = match reply.headers.as_ref().and_then(|h| h.get("KV-Operation")) {
             Some("DEL") => Operation::Delete,
             Some("PURGE") => Operation::Purge,
@@ -186,6 +196,7 @@ impl KeyValue {
             value: reply.payload,
             revision,
             operation,
+            time,
         }))
     }
 
@@ -386,8 +397,8 @@ impl KeyValue {
         let first = info.state.first_seq;
         let last = info.state.last_seq;
 
-        // Track latest entry per key: (seq, data, is_deleted)
-        let mut latest: std::collections::HashMap<String, (u64, Vec<u8>, bool)> =
+        // Track latest entry per key: (seq, data, is_deleted, time)
+        let mut latest: std::collections::HashMap<String, (u64, Vec<u8>, bool, Option<String>)> =
             std::collections::HashMap::new();
 
         for seq in first..=last {
@@ -408,17 +419,18 @@ impl KeyValue {
                 .and_then(|h| crate::jetstream::base64_decode(h).ok())
                 .is_some_and(|bytes| bytes.windows(12).any(|w| w == b"KV-Operation"));
 
-            latest.insert(key.to_string(), (msg.seq, msg.data, is_deleted));
+            latest.insert(key.to_string(), (msg.seq, msg.data, is_deleted, msg.time));
         }
 
         Ok(latest
             .into_iter()
-            .filter(|(_, (_, _, deleted))| !*deleted)
-            .map(|(key, (revision, value, _))| Entry {
+            .filter(|(_, (_, _, deleted, _))| !*deleted)
+            .map(|(key, (revision, value, _, time))| Entry {
                 key,
                 value,
                 revision,
                 operation: Operation::Put,
+                time,
             })
             .collect())
     }
@@ -560,11 +572,18 @@ impl KvWatcher {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
 
+            let time = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("Nats-Time-Stamp"))
+                .map(str::to_string);
+
             return Ok(Entry {
                 key,
                 value: msg.payload,
                 revision,
                 operation,
+                time,
             });
         }
     }

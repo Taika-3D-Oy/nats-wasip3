@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] – 2026-04-22
+
+### Added
+
+**Server-side message timestamps**
+- `StreamMessage::time: Option<String>` — RFC 3339 publish timestamp returned by
+  the server in the `STREAM.MSG.GET` JSON response.
+- `JsMessage::timestamp() -> Option<&str>` — RFC 3339 publish timestamp from the
+  `Nats-Time-Stamp` header present on every JetStream push-consumer delivery.
+- `JsMessage::timestamp_nanos() -> Option<u64>` — nanoseconds-since-Unix-epoch
+  parsed directly from the JetStream ACK reply-to subject (supports both the
+  9-token v1 and 12-token v2 ACK subject formats).
+- `Entry::time: Option<String>` — RFC 3339 publish timestamp exposed on KV
+  entries. Populated from `Nats-Time-Stamp` headers in `get` and `watch`, and
+  from `StreamMessage::time` in `load_all`.
+
+**Object Store `mtime` format fix**
+- `ObjectInfo::mtime` is now written as RFC 3339
+  (e.g. `"2024-04-22T00:00:00.123456789Z"`) instead of raw Unix nanoseconds.
+  This matches the NATS object store specification and ensures interoperability
+  with nats.go and other client libraries.
+
+### Breaking
+- `ObjectInfo::mtime` format changed from raw nanosecond integer string to RFC
+  3339. Objects stored by ≤ 0.7.0 carry the old format; re-`put` them to
+  upgrade, or parse defensively if you read buckets written by mixed versions.
+
 ## [0.7.0] – 2026-04-21
 
 ### Added
