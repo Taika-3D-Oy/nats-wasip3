@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1] – 2026-04-29
+
+### Added
+
+**KV — compare-and-swap delete**
+- `KeyValue::cas_delete(key, expected_revision)` — tombstones a key only if the
+  current revision matches; returns `Err(Error::RevisionMismatch)` otherwise.
+
+**KV — CAS and TTL purge variants**
+- `KeyValue::purge_with_ttl(key, ttl)` — purge all revisions, leaving a tombstone
+  that itself expires after `ttl`.
+- `KeyValue::purge_expect_revision(key, expected_revision)` — purge only if the
+  current revision matches.
+- `KeyValue::purge_expect_revision_with_ttl(key, expected_revision, ttl)` — CAS
+  purge with an expiring tombstone.
+
+**KV — revision-scoped entry lookup**
+- `KeyValue::entry_for_revision(key, revision)` — fetch the entry at a specific
+  stream sequence, including `Delete` and `Purge` tombstones. Useful for history
+  inspection without a full streaming iterator.
+
 ## [0.8.0] – 2026-04-22
 
 ### Added

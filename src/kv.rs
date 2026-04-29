@@ -329,6 +329,27 @@ impl KeyValue {
         Ok(())
     }
 
+    /// Compare-and-swap delete: tombstone a key only if the current revision matches.
+    /// Returns `Err(Error::RevisionMismatch)` if the revision has changed.
+    pub async fn cas_delete(&self, key: &str, expected_revision: u64) -> Result<(), Error> {
+        let mut headers = Headers::new();
+        headers.insert("KV-Operation", "DEL");
+        headers.insert(
+            "Nats-Expected-Last-Subject-Sequence",
+            expected_revision.to_string(),
+        );
+        let subject = self.subject(key);
+        match self
+            .js
+            .publish_with_headers(&subject, &headers, b"")
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Purge a key (remove all revisions).
     pub async fn purge(&self, key: &str) -> Result<(), Error> {
         let mut headers = Headers::new();
@@ -339,6 +360,122 @@ impl KeyValue {
             .publish_with_headers(&subject, &headers, b"")
             .await?;
         Ok(())
+    }
+
+    /// Purge a key with a TTL on the tombstone.
+    /// The purge marker itself expires after `ttl`; see [`KeyValue::put_with_ttl`] for TTL semantics.
+    pub async fn purge_with_ttl(&self, key: &str, ttl: Duration) -> Result<(), Error> {
+        let mut headers = Headers::new();
+        headers.insert("KV-Operation", "PURGE");
+        headers.insert("Nats-Rollup", "sub");
+        headers.insert("Nats-TTL", format_ttl(ttl));
+        let subject = self.subject(key);
+        self.js
+            .publish_with_headers(&subject, &headers, b"")
+            .await?;
+        Ok(())
+    }
+
+    /// Compare-and-swap purge: remove all revisions only if the current revision matches.
+    /// Returns `Err(Error::RevisionMismatch)` if the revision has changed.
+    pub async fn purge_expect_revision(
+        &self,
+        key: &str,
+        expected_revision: u64,
+    ) -> Result<(), Error> {
+        let mut headers = Headers::new();
+        headers.insert("KV-Operation", "PURGE");
+        headers.insert("Nats-Rollup", "sub");
+        headers.insert(
+            "Nats-Expected-Last-Subject-Sequence",
+            expected_revision.to_string(),
+        );
+        let subject = self.subject(key);
+        match self
+            .js
+            .publish_with_headers(&subject, &headers, b"")
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Compare-and-swap purge with a TTL tombstone.
+    /// See [`KeyValue::purge_expect_revision`] and [`KeyValue::purge_with_ttl`].
+    pub async fn purge_expect_revision_with_ttl(
+        &self,
+        key: &str,
+        expected_revision: u64,
+        ttl: Duration,
+    ) -> Result<(), Error> {
+        let mut headers = Headers::new();
+        headers.insert("KV-Operation", "PURGE");
+        headers.insert("Nats-Rollup", "sub");
+        headers.insert(
+            "Nats-Expected-Last-Subject-Sequence",
+            expected_revision.to_string(),
+        );
+        headers.insert("Nats-TTL", format_ttl(ttl));
+        let subject = self.subject(key);
+        match self
+            .js
+            .publish_with_headers(&subject, &headers, b"")
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get the entry at a specific stream sequence (revision).
+    ///
+    /// Unlike [`KeyValue::get`], this returns deleted and purged entries too,
+    /// making it suitable for history inspection.
+    /// Returns `None` if no message exists at that sequence or it does not
+    /// belong to this key.
+    pub async fn entry_for_revision(
+        &self,
+        key: &str,
+        revision: u64,
+    ) -> Result<Option<Entry>, Error> {
+        let msg = match self.js.stream_get_msg(&self.stream_name, revision).await? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        // Confirm the message belongs to this key.
+        if msg.subject != self.subject(key) {
+            return Ok(None);
+        }
+
+        // Decode the operation from raw NATS wire headers.
+        let operation = if let Some(hdrs) = &msg.headers_b64 {
+            crate::jetstream::base64_decode(hdrs)
+                .ok()
+                .and_then(|bytes| {
+                    if bytes.windows(17).any(|w| w == b"KV-Operation: DEL") {
+                        Some(Operation::Delete)
+                    } else if bytes.windows(19).any(|w| w == b"KV-Operation: PURGE") {
+                        Some(Operation::Purge)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Operation::Put)
+        } else {
+            Operation::Put
+        };
+
+        Ok(Some(Entry {
+            key: key.to_string(),
+            value: msg.data,
+            revision: msg.seq,
+            operation,
+            time: msg.time,
+        }))
     }
 
     /// List all keys in the bucket.
