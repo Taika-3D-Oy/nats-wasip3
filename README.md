@@ -148,6 +148,28 @@ cargo build --target wasm32-wasip3 --example integration_tests --features tls
 | `kv`         | yes     | NATS KV with CAS, Watch (implies `jetstream`) |
 | `nkey`       | no      | NKey authentication (Ed25519)            |
 
+## KV watch APIs
+
+The KV API includes nats.rs-style watch variants:
+
+- `watch(start_after_seq)` — existing API for replay/new behavior based on
+  sequence.
+- `watch_all()` — all keys, new updates only.
+- `watch_all_from_revision(revision)` — all keys from a stream revision.
+- `watch_all_with_history()` — latest value per key first, then live updates.
+- `watch_many(keys)` — selected keys, new updates only.
+- `watch_many_with_history(keys)` — selected keys with latest-per-key snapshot,
+  then live updates.
+- `watch_many_from_revision(keys, revision)` — selected keys from a stream
+  revision.
+
+Notes:
+
+- `watch_many*` uses JetStream `filter_subjects` and requires NATS server 2.10+.
+  On older servers the library returns a clear compatibility error.
+- `load_all()` now uses a consumer snapshot (`DeliverPolicy::LastPerSubject`),
+  returning only the latest non-deleted value per key.
+
 ## Quick start
 
 ```rust

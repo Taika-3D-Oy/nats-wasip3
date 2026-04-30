@@ -514,62 +514,93 @@ impl KeyValue {
             }
         }
 
+        // Best-effort cleanup for ephemeral consumer.
+        let _ = self.js.delete_consumer(&self.stream_name, &info.name).await;
+
         Ok(keys)
     }
 
     /// Bulk-load all live entries from the bucket.
     /// Returns the latest value for each non-deleted key.
     pub async fn load_all(&self) -> Result<Vec<Entry>, Error> {
-        let info = match self.js.stream_info(&self.stream_name).await {
+        let subject = format!("{KV_SUBJECT_PREFIX}.{}.>", self.bucket);
+        let consumer_cfg = ConsumerConfig {
+            durable_name: None,
+            filter_subject: Some(subject),
+            deliver_policy: DeliverPolicy::LastPerSubject,
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            ..Default::default()
+        };
+
+        let info = match self
+            .js
+            .create_consumer(&self.stream_name, &consumer_cfg)
+            .await
+        {
             Ok(info) => info,
             Err(Error::JetStream { code: 404, .. }) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
 
-        if info.state.messages == 0 {
-            return Ok(Vec::new());
-        }
-
+        let mut entries = Vec::new();
         let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
-        let first = info.state.first_seq;
-        let last = info.state.last_seq;
+        const LOAD_BATCH: u32 = 256;
 
-        // Track latest entry per key: (seq, data, is_deleted, time)
-        let mut latest: std::collections::HashMap<String, (u64, Vec<u8>, bool, Option<String>)> =
-            std::collections::HashMap::new();
+        loop {
+            let msgs = self.js.fetch(&self.stream_name, &info.name, LOAD_BATCH).await?;
+            if msgs.is_empty() {
+                break;
+            }
 
-        for seq in first..=last {
-            let msg = match self.js.stream_get_msg(&self.stream_name, seq).await {
-                Ok(Some(m)) => m,
-                Ok(None) => continue,
-                Err(_) => continue,
-            };
+            let msgs_len = msgs.len();
 
-            let Some(key) = msg.subject.strip_prefix(&prefix) else {
-                continue;
-            };
+            for msg in msgs {
+                let Some(key) = msg.subject.strip_prefix(&prefix) else {
+                    continue;
+                };
 
-            // Check if this is a delete/purge operation by looking for KV-Operation header.
-            let is_deleted = msg
-                .headers_b64
-                .as_ref()
-                .and_then(|h| crate::jetstream::base64_decode(h).ok())
-                .is_some_and(|bytes| bytes.windows(12).any(|w| w == b"KV-Operation"));
+                let operation = match msg.headers.as_ref().and_then(|h| h.get("KV-Operation")) {
+                    Some("DEL") => Operation::Delete,
+                    Some("PURGE") => Operation::Purge,
+                    _ => Operation::Put,
+                };
 
-            latest.insert(key.to_string(), (msg.seq, msg.data, is_deleted, msg.time));
+                if operation != Operation::Put {
+                    continue;
+                }
+
+                let revision = msg
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get("Nats-Sequence"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let time = msg
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get("Nats-Time-Stamp"))
+                    .map(str::to_string);
+
+                entries.push(Entry {
+                    key: key.to_string(),
+                    value: msg.payload,
+                    revision,
+                    operation,
+                    time,
+                });
+            }
+
+            if msgs_len < LOAD_BATCH as usize {
+                break;
+            }
         }
 
-        Ok(latest
-            .into_iter()
-            .filter(|(_, (_, _, deleted, _))| !*deleted)
-            .map(|(key, (revision, value, _, time))| Entry {
-                key,
-                value,
-                revision,
-                operation: Operation::Put,
-                time,
-            })
-            .collect())
+        // Best-effort cleanup for ephemeral consumer.
+        let _ = self.js.delete_consumer(&self.stream_name, &info.name).await;
+
+        Ok(entries)
     }
 
     /// Return runtime status / statistics for this bucket.
@@ -602,6 +633,86 @@ impl KeyValue {
     /// get all history, or the stream's `last_seq` to only get future changes).
     /// Returns a `KvWatcher` that yields `Entry` items as they arrive.
     pub async fn watch(&self, start_after_seq: u64) -> Result<KvWatcher, Error> {
+        if start_after_seq == 0 {
+            self.create_watcher(DeliverPolicy::All, None).await
+        } else {
+            self.create_watcher(DeliverPolicy::ByStartSequence, Some(start_after_seq + 1))
+                .await
+        }
+    }
+
+    /// Watch all keys for new changes only.
+    ///
+    /// This mirrors `watch_all()` in `nats.rs`: no full history replay,
+    /// only updates published after the watcher is created.
+    pub async fn watch_all(&self) -> Result<KvWatcher, Error> {
+        self.create_watcher(DeliverPolicy::New, None).await
+    }
+
+    /// Watch all keys starting from a specific stream revision.
+    ///
+    /// This mirrors `watch_all_from_revision()` in `nats.rs`.
+    pub async fn watch_all_from_revision(&self, revision: u64) -> Result<KvWatcher, Error> {
+        self.create_watcher(DeliverPolicy::ByStartSequence, Some(revision))
+            .await
+    }
+
+    /// Watch all keys with the latest value per key first, then live updates.
+    ///
+    /// This mirrors `watch_*_with_history()` behavior based on
+    /// `DeliverPolicy::LastPerSubject`.
+    pub async fn watch_all_with_history(&self) -> Result<KvWatcher, Error> {
+        self.create_watcher(DeliverPolicy::LastPerSubject, None)
+            .await
+    }
+
+    /// Watch a set of keys for new changes only.
+    ///
+    /// This mirrors `watch_many()` in `nats.rs`.
+    /// Requires NATS server 2.10+ (`filter_subjects`).
+    pub async fn watch_many<T, K>(&self, keys: K) -> Result<KvWatcher, Error>
+    where
+        T: AsRef<str>,
+        K: IntoIterator<Item = T>,
+    {
+        self.create_watcher_many(keys, DeliverPolicy::New, None).await
+    }
+
+    /// Watch a set of keys with latest values first, then live updates.
+    ///
+    /// This mirrors `watch_many_with_history()` in `nats.rs`.
+    /// Requires NATS server 2.10+ (`filter_subjects`).
+    pub async fn watch_many_with_history<T, K>(&self, keys: K) -> Result<KvWatcher, Error>
+    where
+        T: AsRef<str>,
+        K: IntoIterator<Item = T>,
+    {
+        self.create_watcher_many(keys, DeliverPolicy::LastPerSubject, None)
+            .await
+    }
+
+    /// Watch a set of keys from a specific stream revision.
+    ///
+    /// This mirrors `watch_many` + `ByStartSequence` semantics.
+    /// Requires NATS server 2.10+ (`filter_subjects`).
+    pub async fn watch_many_from_revision<T, K>(
+        &self,
+        keys: K,
+        revision: u64,
+    ) -> Result<KvWatcher, Error>
+    where
+        T: AsRef<str>,
+        K: IntoIterator<Item = T>,
+    {
+        self.create_watcher_many(keys, DeliverPolicy::ByStartSequence, Some(revision))
+            .await
+    }
+
+    async fn create_watcher(
+        &self,
+        deliver_policy: DeliverPolicy,
+        opt_start_seq: Option<u64>,
+    ) -> Result<KvWatcher, Error> {
         // Unique deliver subject for this watcher.
         let deliver = format!("_kv_watch.{}.{}", self.bucket, {
             use std::cell::Cell;
@@ -619,17 +730,10 @@ impl KeyValue {
 
         let consumer_cfg = ConsumerConfig {
             filter_subject: Some(filter),
+            filter_subjects: None,
             deliver_subject: Some(deliver.clone()),
-            deliver_policy: if start_after_seq == 0 {
-                DeliverPolicy::All
-            } else {
-                DeliverPolicy::ByStartSequence
-            },
-            opt_start_seq: if start_after_seq == 0 {
-                None
-            } else {
-                Some(start_after_seq + 1)
-            },
+            deliver_policy,
+            opt_start_seq,
             ack_policy: AckPolicy::None,
             max_deliver: 1,
             replay_policy: Some(crate::jetstream::ReplayPolicy::Instant),
@@ -654,6 +758,87 @@ impl KeyValue {
             stream_name: self.stream_name.clone(),
             consumer_name: info.name,
         })
+    }
+
+    async fn create_watcher_many<T, K>(
+        &self,
+        keys: K,
+        deliver_policy: DeliverPolicy,
+        opt_start_seq: Option<u64>,
+    ) -> Result<KvWatcher, Error>
+    where
+        T: AsRef<str>,
+        K: IntoIterator<Item = T>,
+    {
+        let filter_subjects = keys
+            .into_iter()
+            .map(|k| format!("{KV_SUBJECT_PREFIX}.{}.{}", self.bucket, k.as_ref()))
+            .collect::<Vec<_>>();
+
+        if filter_subjects.is_empty() {
+            return Err(Error::Protocol("watch_many requires at least one key".into()));
+        }
+
+        // Unique deliver subject for this watcher.
+        let deliver = format!("_kv_watch.{}.{}", self.bucket, {
+            use std::cell::Cell;
+            thread_local! {
+                static CTR: Cell<u64> = const { Cell::new(0) };
+            }
+            CTR.with(|c| {
+                let v = c.get();
+                c.set(v + 1);
+                v
+            })
+        });
+
+        let consumer_cfg = ConsumerConfig {
+            filter_subject: None,
+            filter_subjects: Some(filter_subjects),
+            deliver_subject: Some(deliver.clone()),
+            deliver_policy,
+            opt_start_seq,
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            replay_policy: Some(crate::jetstream::ReplayPolicy::Instant),
+            mem_storage: Some(true),
+            ..Default::default()
+        };
+
+        let info = self
+            .js
+            .create_consumer(&self.stream_name, &consumer_cfg)
+            .await
+            .map_err(map_watch_many_create_error)?;
+
+        // Subscribe to the deliver subject to receive pushed messages.
+        let sub = self.js.client().subscribe(&deliver)?;
+
+        let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
+
+        Ok(KvWatcher {
+            sub,
+            prefix,
+            js: self.js.clone(),
+            stream_name: self.stream_name.clone(),
+            consumer_name: info.name,
+        })
+    }
+}
+
+fn map_watch_many_create_error(err: Error) -> Error {
+    match err {
+        Error::JetStream { code, description }
+            if code == 400
+                && (description.to_ascii_lowercase().contains("filter_subjects")
+                    || description.to_ascii_lowercase().contains("filter subjects")) =>
+        {
+            Error::Protocol(
+                "watch_many requires NATS server 2.10+ with consumer filter_subjects support"
+                    .into(),
+            )
+        }
+        other => other,
     }
 }
 
@@ -757,5 +942,34 @@ mod tests {
     fn format_ttl_truncates_partial() {
         // 1.999 seconds → 1s (truncation, server has second granularity)
         assert_eq!(format_ttl(1_999_000_000), "1s");
+    }
+
+    #[test]
+    fn map_watch_many_error_for_unsupported_filter_subjects() {
+        let mapped = map_watch_many_create_error(Error::JetStream {
+            code: 400,
+            description: "unknown field: filter_subjects".to_string(),
+        });
+
+        match mapped {
+            Error::Protocol(msg) => assert!(msg.contains("2.10+")),
+            other => panic!("expected protocol error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_watch_many_error_passthrough_other_errors() {
+        let mapped = map_watch_many_create_error(Error::JetStream {
+            code: 503,
+            description: "service unavailable".to_string(),
+        });
+
+        match mapped {
+            Error::JetStream { code, description } => {
+                assert_eq!(code, 503);
+                assert_eq!(description, "service unavailable");
+            }
+            other => panic!("expected original jetstream error, got: {other:?}"),
+        }
     }
 }

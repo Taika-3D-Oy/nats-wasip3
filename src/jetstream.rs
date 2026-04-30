@@ -650,6 +650,8 @@ pub struct ConsumerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_subject: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_subjects: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_subject: Option<String>,
     #[serde(default)]
     pub deliver_policy: DeliverPolicy,

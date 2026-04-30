@@ -1547,6 +1547,174 @@ async fn test_kv_watch_from_seq() {
     js.delete_stream("KV_watchseq").await.unwrap();
 }
 
+#[cfg(feature = "kv")]
+async fn test_kv_watch_all_new_only() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_watchall_new").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "watchall_new".into(),
+            history: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Existing value should not be replayed by watch_all().
+    kv.put("pre", b"old").await.unwrap();
+
+    let watcher = kv.watch_all().await.unwrap();
+
+    kv.put("post", b"new").await.unwrap();
+    let e = watcher.next().await.unwrap();
+    assert_eq!(e.key, "post");
+    assert_eq!(e.value, b"new");
+
+    js.delete_stream("KV_watchall_new").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_watch_all_with_history() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_watchall_hist").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "watchall_hist".into(),
+            history: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    kv.put("a", b"1").await.unwrap();
+    kv.put("b", b"2").await.unwrap();
+    kv.put("a", b"3").await.unwrap();
+
+    let watcher = kv.watch_all_with_history().await.unwrap();
+
+    // Snapshot should include latest value per key (a=3, b=2), order not guaranteed.
+    let first = watcher.next().await.unwrap();
+    let second = watcher.next().await.unwrap();
+
+    let got_a = (first.key == "a" && first.value == b"3") || (second.key == "a" && second.value == b"3");
+    let got_b = (first.key == "b" && first.value == b"2") || (second.key == "b" && second.value == b"2");
+    assert!(got_a, "expected latest snapshot value for key a");
+    assert!(got_b, "expected latest snapshot value for key b");
+
+    // After snapshot, watcher should continue with live updates.
+    kv.put("c", b"4").await.unwrap();
+    let third = watcher.next().await.unwrap();
+    assert_eq!(third.key, "c");
+    assert_eq!(third.value, b"4");
+
+    js.delete_stream("KV_watchall_hist").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_watch_many_new_only() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_watchmany_new").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "watchmany_new".into(),
+            history: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    kv.put("k1", b"old1").await.unwrap();
+    kv.put("k2", b"old2").await.unwrap();
+    kv.put("k3", b"old3").await.unwrap();
+
+    // Watch only k1 and k3, new updates only.
+    let watcher = kv.watch_many(["k1", "k3"]).await.unwrap();
+
+    kv.put("k2", b"new2").await.unwrap(); // should be filtered out
+    kv.put("k1", b"new1").await.unwrap();
+    let e1 = watcher.next().await.unwrap();
+    assert_eq!(e1.key, "k1");
+    assert_eq!(e1.value, b"new1");
+
+    kv.put("k3", b"new3").await.unwrap();
+    let e2 = watcher.next().await.unwrap();
+    assert_eq!(e2.key, "k3");
+    assert_eq!(e2.value, b"new3");
+
+    js.delete_stream("KV_watchmany_new").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_watch_many_with_history() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_watchmany_hist").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "watchmany_hist".into(),
+            history: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    kv.put("a", b"1").await.unwrap();
+    kv.put("b", b"2").await.unwrap();
+    kv.put("a", b"3").await.unwrap();
+    kv.put("c", b"4").await.unwrap();
+
+    // Watch subset a+b with history.
+    let watcher = kv.watch_many_with_history(["a", "b"]).await.unwrap();
+
+    let first = watcher.next().await.unwrap();
+    let second = watcher.next().await.unwrap();
+
+    let got_a = (first.key == "a" && first.value == b"3") || (second.key == "a" && second.value == b"3");
+    let got_b = (first.key == "b" && first.value == b"2") || (second.key == "b" && second.value == b"2");
+    assert!(got_a, "expected latest snapshot value for key a");
+    assert!(got_b, "expected latest snapshot value for key b");
+
+    kv.put("c", b"5").await.unwrap(); // should be filtered out
+    kv.put("b", b"6").await.unwrap();
+
+    let third = watcher.next().await.unwrap();
+    assert_eq!(third.key, "b");
+    assert_eq!(third.value, b"6");
+
+    js.delete_stream("KV_watchmany_hist").await.unwrap();
+}
+
 // ══════════════════════════════════════════════════════════════════
 //  JetStream: purge_stream_subject, max_msgs_per_subject
 // ══════════════════════════════════════════════════════════════════
@@ -1904,6 +2072,10 @@ async fn run_tests() {
         run_test!("test_kv_delete_then_create", test_kv_delete_then_create().await);
         run_test!("test_kv_status", test_kv_status().await);
         run_test!("test_kv_watch_from_seq", test_kv_watch_from_seq().await);
+        run_test!("test_kv_watch_all_new_only", test_kv_watch_all_new_only().await);
+        run_test!("test_kv_watch_all_with_history", test_kv_watch_all_with_history().await);
+        run_test!("test_kv_watch_many_new_only", test_kv_watch_many_new_only().await);
+        run_test!("test_kv_watch_many_with_history", test_kv_watch_many_with_history().await);
         run_test!("test_kv_put_with_ttl", test_kv_put_with_ttl().await);
     }
 

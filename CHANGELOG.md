@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.2] – 2026-04-30
+
+### Added
+
+**KV — nats.rs-aligned watch APIs**
+- `KeyValue::watch_all()` — watch all keys for new updates only.
+- `KeyValue::watch_all_from_revision(revision)` — watch all keys starting from a
+  stream sequence.
+- `KeyValue::watch_all_with_history()` — emit latest value per key first, then
+  continue with live updates (`DeliverPolicy::LastPerSubject`).
+- `KeyValue::watch_many(keys)` — watch a selected set of keys for new updates.
+- `KeyValue::watch_many_with_history(keys)` — selected keys with
+  latest-per-key snapshot first, then live updates.
+- `KeyValue::watch_many_from_revision(keys, revision)` — selected keys from a
+  specific stream sequence.
+
+**JetStream — consumer multi-filter support**
+- `ConsumerConfig::filter_subjects: Option<Vec<String>>` added to support
+  multi-key KV watchers.
+
+### Changed
+
+**KV — load_all implementation**
+- `KeyValue::load_all()` now uses an ephemeral
+  `DeliverPolicy::LastPerSubject` consumer snapshot instead of per-sequence
+  `STREAM.MSG.GET` scanning, reducing request volume on large/history-heavy
+  buckets.
+
+### Fixed
+
+**KV — watch_many server compatibility error message**
+- On servers without `filter_subjects` support (pre-2.10), `watch_many*`
+  now returns a clear compatibility error:
+  `watch_many requires NATS server 2.10+ with consumer filter_subjects support`.
+
 ## [0.8.1] – 2026-04-29
 
 ### Added
