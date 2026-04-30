@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] – 2026-04-30
+
+### Fixed
+
+- **KV — watcher/load_all/history revision extraction**: Consumer-delivered
+  messages (push watchers, pull fetch) carry the stream sequence in the
+  JetStream reply-to subject (`$JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>...`),
+  not in the `Nats-Sequence` header (which only exists in `$JS.API.DIRECT.GET`
+  responses). Previously all three code paths — `KvWatcher::next()`,
+  `load_all()`, and `history()` — extracted revision from the header alone,
+  yielding `0` for every watcher/fetch message. This caused downstream
+  consumers (e.g. lattice-db replicas) to never advance their applied-revision
+  watermark, breaking cross-replica consistency.
+- Added `extract_revision(msg)` helper that checks `Nats-Sequence` first, then
+  falls back to parsing the `$JS.ACK` reply-to subject (index 5).
+
 ## [0.9.0] – 2026-04-30
 
 ### Added

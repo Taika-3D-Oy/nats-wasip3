@@ -636,12 +636,7 @@ impl KeyValue {
                     continue;
                 }
 
-                let revision = msg
-                    .headers
-                    .as_ref()
-                    .and_then(|h| h.get("Nats-Sequence"))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+                let revision = extract_revision(&msg);
 
                 let time = msg
                     .headers
@@ -721,12 +716,7 @@ impl KeyValue {
                     _ => Operation::Put,
                 };
 
-                let revision = msg
-                    .headers
-                    .as_ref()
-                    .and_then(|h| h.get("Nats-Sequence"))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+                let revision = extract_revision(&msg);
 
                 let time = msg
                     .headers
@@ -1075,13 +1065,8 @@ impl KvWatcher {
                 _ => Operation::Put,
             };
 
-            // Extract revision from Nats-Sequence header.
-            let revision = msg
-                .headers
-                .as_ref()
-                .and_then(|h| h.get("Nats-Sequence"))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            // Extract revision from Nats-Sequence header or reply-to subject.
+            let revision = extract_revision(&msg);
 
             let time = msg
                 .headers
@@ -1098,6 +1083,35 @@ impl KvWatcher {
             });
         }
     }
+}
+
+/// Extract the stream sequence (revision) from a JetStream consumer message.
+///
+/// Consumer-delivered messages carry the stream sequence in the reply-to subject
+/// (`$JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts>.<pending>`)
+/// rather than in a `Nats-Sequence` header (which is only present in direct-get responses).
+/// This function checks the header first, then falls back to parsing the reply-to.
+fn extract_revision(msg: &crate::client::Message) -> u64 {
+    // Prefer the Nats-Sequence header (present in $JS.API.DIRECT.GET responses).
+    if let Some(rev) = msg
+        .headers
+        .as_ref()
+        .and_then(|h| h.get("Nats-Sequence"))
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return rev;
+    }
+    // Fall back to the reply-to subject which encodes stream_seq at index 5.
+    // Format: $JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts>.<pending>[.<token>]
+    if let Some(ref reply) = msg.reply_to {
+        let parts: Vec<&str> = reply.split('.').collect();
+        if parts.len() >= 9 && parts[0] == "$JS" && parts[1] == "ACK" {
+            if let Ok(seq) = parts[5].parse::<u64>() {
+                return seq;
+            }
+        }
+    }
+    0
 }
 
 /// Format a nanosecond `Duration` as a NATS `Nats-TTL` header value.
