@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] – 2026-04-30
+
+### Added
+
+**KV — per-key watch APIs (nats.rs alignment)**
+- `KeyValue::watch(key)` — watch a single key; delivers the current value first
+  (`DeliverPolicy::LastPerSubject`), then streams all future updates.
+  **Breaking:** replaces the old `watch(start_after_seq: u64)` signature.
+- `KeyValue::watch_with_history(key)` — watch a single key replaying its full
+  history first (`DeliverPolicy::All`), then live updates.
+- `KeyValue::watch_from_revision(key, revision)` — watch a single key starting
+  from a specific stream revision.
+- `KeyValue::entry(key)` — like `get` but returns tombstone entries
+  (`Operation::Delete` / `Operation::Purge`) instead of `None`.
+- `KeyValue::history(key)` — return all historical revisions for a key
+  (requires `history > 1` on the bucket).
+- `KeyValue::delete_expect_revision(key, revision)` — canonical nats.rs name
+  for compare-and-swap delete.
+- `KeyValue::stream_name()` — expose the backing JetStream stream name.
+
+### Changed
+
+- `KeyValue::cas_delete` is now `#[deprecated]`; use `delete_expect_revision`.
+- Bucket-wide watcher helpers (`watch_all`, `watch_all_with_history`,
+  `watch_all_from_revision`) refactored to share an internal
+  `create_watcher_subject` helper, also used by the new per-key methods.
+
+### Breaking
+
+- `KeyValue::watch(start_after_seq: u64)` → `KeyValue::watch(key: impl AsRef<str>)`.
+  Migrate: `watch(0)` → `watch_all_with_history()` or `watch_all()`;
+  `watch(rev)` → `watch_all_from_revision(rev)`.
+
 ## [0.8.2] – 2026-04-30
 
 ### Added

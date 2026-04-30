@@ -200,6 +200,60 @@ impl KeyValue {
         }))
     }
 
+    /// Get the latest entry for a key, including deleted and purged entries.
+    ///
+    /// Unlike [`KeyValue::get`] which returns `None` for tombstones, this returns
+    /// the actual [`Entry`] with [`Operation::Delete`] or [`Operation::Purge`] set.
+    /// Returns `None` only when the key has never existed.
+    /// Mirrors `async_nats::jetstream::kv::Store::entry`.
+    pub async fn entry(&self, key: &str) -> Result<Option<Entry>, Error> {
+        let subject = self.subject(key);
+        let direct_subject = format!("$JS.API.DIRECT.GET.{}.{}", self.stream_name, subject);
+        let reply = match self
+            .js
+            .client()
+            .request(&direct_subject, b"", secs(5))
+            .await
+        {
+            Ok(msg) => msg,
+            Err(Error::Timeout) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if let Some(ref headers) = reply.headers {
+            if headers.status == Some(404) {
+                return Ok(None);
+            }
+        }
+
+        let revision = reply
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("Nats-Sequence"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let time = reply
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("Nats-Time-Stamp"))
+            .map(str::to_string);
+
+        let operation = match reply.headers.as_ref().and_then(|h| h.get("KV-Operation")) {
+            Some("DEL") => Operation::Delete,
+            Some("PURGE") => Operation::Purge,
+            _ => Operation::Put,
+        };
+
+        Ok(Some(Entry {
+            key: key.to_string(),
+            value: reply.payload,
+            revision,
+            operation,
+            time,
+        }))
+    }
+
     /// Put a value (unconditional write). Returns the revision.
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<u64, Error> {
         let subject = self.subject(key);
@@ -329,9 +383,15 @@ impl KeyValue {
         Ok(())
     }
 
-    /// Compare-and-swap delete: tombstone a key only if the current revision matches.
+    /// Delete a key only if the current revision matches.
     /// Returns `Err(Error::RevisionMismatch)` if the revision has changed.
-    pub async fn cas_delete(&self, key: &str, expected_revision: u64) -> Result<(), Error> {
+    ///
+    /// Mirrors `async_nats::jetstream::kv::Store::delete_expect_revision`.
+    pub async fn delete_expect_revision(
+        &self,
+        key: &str,
+        expected_revision: u64,
+    ) -> Result<(), Error> {
         let mut headers = Headers::new();
         headers.insert("KV-Operation", "DEL");
         headers.insert(
@@ -348,6 +408,12 @@ impl KeyValue {
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
             Err(e) => Err(e),
         }
+    }
+
+    /// Deprecated alias for [`KeyValue::delete_expect_revision`].
+    #[deprecated(since = "0.9.0", note = "use `delete_expect_revision` instead")]
+    pub async fn cas_delete(&self, key: &str, expected_revision: u64) -> Result<(), Error> {
+        self.delete_expect_revision(key, expected_revision).await
     }
 
     /// Purge a key (remove all revisions).
@@ -603,6 +669,89 @@ impl KeyValue {
         Ok(entries)
     }
 
+    /// Return all historical revisions for a key, including tombstones.
+    ///
+    /// Requires the bucket to have been created with `history > 1` to hold
+    /// more than the latest revision. All operations (Put, Delete, Purge) are
+    /// included in sequence order.
+    /// Mirrors `async_nats::jetstream::kv::Store::history`.
+    pub async fn history(&self, key: &str) -> Result<Vec<Entry>, Error> {
+        let subject = self.subject(key);
+        let consumer_cfg = ConsumerConfig {
+            durable_name: None,
+            filter_subject: Some(subject),
+            deliver_policy: DeliverPolicy::All,
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            ..Default::default()
+        };
+
+        let info = match self
+            .js
+            .create_consumer(&self.stream_name, &consumer_cfg)
+            .await
+        {
+            Ok(info) => info,
+            Err(Error::JetStream { code: 404, .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut entries = Vec::new();
+        let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
+        const HISTORY_BATCH: u32 = 256;
+
+        loop {
+            let msgs = self
+                .js
+                .fetch(&self.stream_name, &info.name, HISTORY_BATCH)
+                .await?;
+            if msgs.is_empty() {
+                break;
+            }
+            let msgs_len = msgs.len();
+
+            for msg in msgs {
+                let Some(key_str) = msg.subject.strip_prefix(&prefix) else {
+                    continue;
+                };
+
+                let operation = match msg.headers.as_ref().and_then(|h| h.get("KV-Operation")) {
+                    Some("DEL") => Operation::Delete,
+                    Some("PURGE") => Operation::Purge,
+                    _ => Operation::Put,
+                };
+
+                let revision = msg
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get("Nats-Sequence"))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let time = msg
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get("Nats-Time-Stamp"))
+                    .map(str::to_string);
+
+                entries.push(Entry {
+                    key: key_str.to_string(),
+                    value: msg.payload,
+                    revision,
+                    operation,
+                    time,
+                });
+            }
+
+            if msgs_len < HISTORY_BATCH as usize {
+                break;
+            }
+        }
+
+        let _ = self.js.delete_consumer(&self.stream_name, &info.name).await;
+        Ok(entries)
+    }
+
     /// Return runtime status / statistics for this bucket.
     pub async fn status(&self) -> Result<KvStatus, Error> {
         let info = self.js.stream_info(&self.stream_name).await?;
@@ -627,49 +776,81 @@ impl KeyValue {
         &self.bucket
     }
 
-    /// Watch for live changes to this KV bucket.
-    ///
-    /// Creates an ordered push consumer starting after `last_seq` (use 0 to
-    /// get all history, or the stream's `last_seq` to only get future changes).
-    /// Returns a `KvWatcher` that yields `Entry` items as they arrive.
-    pub async fn watch(&self, start_after_seq: u64) -> Result<KvWatcher, Error> {
-        if start_after_seq == 0 {
-            self.create_watcher(DeliverPolicy::All, None).await
-        } else {
-            self.create_watcher(DeliverPolicy::ByStartSequence, Some(start_after_seq + 1))
-                .await
-        }
+    /// The name of the backing JetStream stream (`KV_{bucket}`).
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
     }
 
-    /// Watch all keys for new changes only.
+    // ── Per-key watchers ───────────────────────────────────────────
+
+    /// Watch a single key for changes, receiving the latest value first.
     ///
-    /// This mirrors `watch_all()` in `nats.rs`: no full history replay,
-    /// only updates published after the watcher is created.
+    /// Delivers the current value for the key (if one exists) immediately,
+    /// then streams all future updates. Uses `DeliverPolicy::LastPerSubject`
+    /// filtered to the specific key subject.
+    /// Mirrors `async_nats::jetstream::kv::Store::watch`.
+    pub async fn watch(&self, key: impl AsRef<str>) -> Result<KvWatcher, Error> {
+        let subject = self.subject(key.as_ref());
+        self.create_watcher_subject(subject, DeliverPolicy::LastPerSubject, None)
+            .await
+    }
+
+    /// Watch a single key, replaying all history first then streaming updates.
+    ///
+    /// Uses `DeliverPolicy::All` filtered to the specific key subject.
+    /// Requires `history > 1` on the bucket to see more than one revision.
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_with_history`.
+    pub async fn watch_with_history(&self, key: impl AsRef<str>) -> Result<KvWatcher, Error> {
+        let subject = self.subject(key.as_ref());
+        self.create_watcher_subject(subject, DeliverPolicy::All, None)
+            .await
+    }
+
+    /// Watch a single key starting from a specific stream revision.
+    ///
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_from_revision`.
+    pub async fn watch_from_revision(
+        &self,
+        key: impl AsRef<str>,
+        revision: u64,
+    ) -> Result<KvWatcher, Error> {
+        let subject = self.subject(key.as_ref());
+        self.create_watcher_subject(subject, DeliverPolicy::ByStartSequence, Some(revision))
+            .await
+    }
+
+    // ── Bucket-wide watchers ───────────────────────────────────────
+
+    /// Watch all keys for new changes only (no history replay).
+    ///
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_all`.
     pub async fn watch_all(&self) -> Result<KvWatcher, Error> {
         self.create_watcher(DeliverPolicy::New, None).await
     }
 
     /// Watch all keys starting from a specific stream revision.
     ///
-    /// This mirrors `watch_all_from_revision()` in `nats.rs`.
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_all_from_revision`.
     pub async fn watch_all_from_revision(&self, revision: u64) -> Result<KvWatcher, Error> {
         self.create_watcher(DeliverPolicy::ByStartSequence, Some(revision))
             .await
     }
 
-    /// Watch all keys with the latest value per key first, then live updates.
+    /// Watch all keys delivering the latest value per key first, then live updates.
     ///
-    /// This mirrors `watch_*_with_history()` behavior based on
-    /// `DeliverPolicy::LastPerSubject`.
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_all_with_history`
+    /// (`DeliverPolicy::LastPerSubject`).
     pub async fn watch_all_with_history(&self) -> Result<KvWatcher, Error> {
         self.create_watcher(DeliverPolicy::LastPerSubject, None)
             .await
     }
 
+    // ── Multi-key watchers ─────────────────────────────────────────
+
     /// Watch a set of keys for new changes only.
     ///
-    /// This mirrors `watch_many()` in `nats.rs`.
     /// Requires NATS server 2.10+ (`filter_subjects`).
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_many`.
     pub async fn watch_many<T, K>(&self, keys: K) -> Result<KvWatcher, Error>
     where
         T: AsRef<str>,
@@ -678,10 +859,10 @@ impl KeyValue {
         self.create_watcher_many(keys, DeliverPolicy::New, None).await
     }
 
-    /// Watch a set of keys with latest values first, then live updates.
+    /// Watch a set of keys delivering the latest value per key first, then live updates.
     ///
-    /// This mirrors `watch_many_with_history()` in `nats.rs`.
     /// Requires NATS server 2.10+ (`filter_subjects`).
+    /// Mirrors `async_nats::jetstream::kv::Store::watch_many_with_history`.
     pub async fn watch_many_with_history<T, K>(&self, keys: K) -> Result<KvWatcher, Error>
     where
         T: AsRef<str>,
@@ -691,9 +872,8 @@ impl KeyValue {
             .await
     }
 
-    /// Watch a set of keys from a specific stream revision.
+    /// Watch a set of keys starting from a specific stream revision.
     ///
-    /// This mirrors `watch_many` + `ByStartSequence` semantics.
     /// Requires NATS server 2.10+ (`filter_subjects`).
     pub async fn watch_many_from_revision<T, K>(
         &self,
@@ -708,8 +888,23 @@ impl KeyValue {
             .await
     }
 
+    // ── Internal watcher helpers ───────────────────────────────────
+
+    /// Bucket-wide watcher (subject = `$KV.{bucket}.>`).
     async fn create_watcher(
         &self,
+        deliver_policy: DeliverPolicy,
+        opt_start_seq: Option<u64>,
+    ) -> Result<KvWatcher, Error> {
+        let filter = format!("{KV_SUBJECT_PREFIX}.{}.>", self.bucket);
+        self.create_watcher_subject(filter, deliver_policy, opt_start_seq)
+            .await
+    }
+
+    /// Core watcher factory: single `filter_subject`, any deliver policy.
+    async fn create_watcher_subject(
+        &self,
+        filter_subject: String,
         deliver_policy: DeliverPolicy,
         opt_start_seq: Option<u64>,
     ) -> Result<KvWatcher, Error> {
@@ -726,10 +921,8 @@ impl KeyValue {
             })
         });
 
-        let filter = format!("{KV_SUBJECT_PREFIX}.{}.>", self.bucket);
-
         let consumer_cfg = ConsumerConfig {
-            filter_subject: Some(filter),
+            filter_subject: Some(filter_subject),
             filter_subjects: None,
             deliver_subject: Some(deliver.clone()),
             deliver_policy,
@@ -746,9 +939,7 @@ impl KeyValue {
             .create_consumer(&self.stream_name, &consumer_cfg)
             .await?;
 
-        // Subscribe to the deliver subject to receive pushed messages.
         let sub = self.js.client().subscribe(&deliver)?;
-
         let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
 
         Ok(KvWatcher {
@@ -760,6 +951,7 @@ impl KeyValue {
         })
     }
 
+    /// Multi-key watcher using `filter_subjects` (NATS server 2.10+).
     async fn create_watcher_many<T, K>(
         &self,
         keys: K,
@@ -779,7 +971,6 @@ impl KeyValue {
             return Err(Error::Protocol("watch_many requires at least one key".into()));
         }
 
-        // Unique deliver subject for this watcher.
         let deliver = format!("_kv_watch.{}.{}", self.bucket, {
             use std::cell::Cell;
             thread_local! {
@@ -811,9 +1002,7 @@ impl KeyValue {
             .await
             .map_err(map_watch_many_create_error)?;
 
-        // Subscribe to the deliver subject to receive pushed messages.
         let sub = self.js.client().subscribe(&deliver)?;
-
         let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
 
         Ok(KvWatcher {

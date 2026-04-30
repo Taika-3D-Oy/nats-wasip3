@@ -728,8 +728,8 @@ async fn test_kv_watch() {
     .await
     .unwrap();
 
-    // Start watching from seq 0 (all history + future).
-    let watcher = kv.watch(0).await.unwrap();
+    // watch_all() receives new changes only (empty stream at start = same as All).
+    let watcher = kv.watch_all().await.unwrap();
 
     // Write some data after starting the watch.
     kv.put("w1", b"val1").await.unwrap();
@@ -1533,8 +1533,8 @@ async fn test_kv_watch_from_seq() {
     let _r2 = kv.put("k", b"2").await.unwrap();
     let r3 = kv.put("k", b"3").await.unwrap();
 
-    // Start watching from seq r1+1 — we should see r2 and r3 only.
-    let watcher = kv.watch(r1 + 1).await.unwrap();
+    // watch_all_from_revision(r1+1) — we should see r2 and r3 only.
+    let watcher = kv.watch_all_from_revision(r1 + 1).await.unwrap();
 
     let e2 = watcher.next().await.unwrap();
     assert_eq!(e2.value, b"2");
@@ -1713,6 +1713,159 @@ async fn test_kv_watch_many_with_history() {
     assert_eq!(third.value, b"6");
 
     js.delete_stream("KV_watchmany_hist").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_entry_tombstone() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig, Operation};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_entry_tomb").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "entry_tomb".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    kv.put("k", b"hello").await.unwrap();
+    kv.delete("k").await.unwrap();
+
+    // get() should return None for a deleted key.
+    let got = kv.get("k").await.unwrap();
+    assert!(got.is_none(), "get() should hide tombstones");
+
+    // entry() should return the tombstone.
+    let e = kv.entry("k").await.unwrap().expect("entry() must return tombstone");
+    assert_eq!(e.key, "k");
+    assert_eq!(e.operation, Operation::Delete);
+
+    // entry() for a never-existing key returns None.
+    let missing = kv.entry("nonexistent").await.unwrap();
+    assert!(missing.is_none(), "entry() for missing key should return None");
+
+    js.delete_stream("KV_entry_tomb").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_history() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig, Operation};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_histtest").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "histtest".into(),
+            history: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    kv.put("h", b"v1").await.unwrap();
+    kv.put("h", b"v2").await.unwrap();
+    kv.put("h", b"v3").await.unwrap();
+    kv.delete("h").await.unwrap();
+
+    // history() for a different key should be empty.
+    let other = kv.history("other").await.unwrap();
+    assert!(other.is_empty());
+
+    let hist = kv.history("h").await.unwrap();
+    assert_eq!(hist.len(), 4, "expected 4 revisions (3 puts + 1 delete)");
+    assert_eq!(hist[0].value, b"v1");
+    assert_eq!(hist[0].operation, Operation::Put);
+    assert_eq!(hist[1].value, b"v2");
+    assert_eq!(hist[2].value, b"v3");
+    assert_eq!(hist[3].operation, Operation::Delete);
+    // Revisions should be monotonically increasing.
+    assert!(hist[0].revision < hist[1].revision);
+    assert!(hist[1].revision < hist[2].revision);
+    assert!(hist[2].revision < hist[3].revision);
+
+    js.delete_stream("KV_histtest").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_watch_single_key() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig, Operation};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_watchkey").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "watchkey".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Pre-seed a value so watch() can deliver it as the initial snapshot.
+    kv.put("target", b"initial").await.unwrap();
+    kv.put("other", b"noise").await.unwrap();
+
+    // watch(key) starts with LastPerSubject: delivers current value first.
+    let watcher = kv.watch("target").await.unwrap();
+
+    let snapshot = watcher.next().await.unwrap();
+    assert_eq!(snapshot.key, "target");
+    assert_eq!(snapshot.value, b"initial");
+    assert_eq!(snapshot.operation, Operation::Put);
+
+    // Live update for "target" should arrive; update to "other" must not.
+    kv.put("other", b"noise2").await.unwrap();
+    kv.put("target", b"updated").await.unwrap();
+
+    let live = watcher.next().await.unwrap();
+    assert_eq!(live.key, "target");
+    assert_eq!(live.value, b"updated");
+
+    js.delete_stream("KV_watchkey").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_stream_name() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_streamnm").await;
+
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "streamnm".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(kv.stream_name(), "KV_streamnm");
+    assert_eq!(kv.bucket(), "streamnm");
+
+    js.delete_stream("KV_streamnm").await.unwrap();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -2076,6 +2229,10 @@ async fn run_tests() {
         run_test!("test_kv_watch_all_with_history", test_kv_watch_all_with_history().await);
         run_test!("test_kv_watch_many_new_only", test_kv_watch_many_new_only().await);
         run_test!("test_kv_watch_many_with_history", test_kv_watch_many_with_history().await);
+        run_test!("test_kv_entry_tombstone", test_kv_entry_tombstone().await);
+        run_test!("test_kv_history", test_kv_history().await);
+        run_test!("test_kv_watch_single_key", test_kv_watch_single_key().await);
+        run_test!("test_kv_stream_name", test_kv_stream_name().await);
         run_test!("test_kv_put_with_ttl", test_kv_put_with_ttl().await);
     }
 
