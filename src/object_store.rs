@@ -121,6 +121,7 @@ impl ObjectStore {
             allow_direct: true,
             allow_rollup_hdrs: true,
             allow_msg_ttl: false,
+            ..Default::default()
         };
 
         js.create_stream(&stream_config).await?;

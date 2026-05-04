@@ -565,6 +565,21 @@ pub struct StreamConfig {
     /// Allow per-message TTL via the `Nats-TTL` header (NATS server 2.11+).
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_msg_ttl: bool,
+    /// Mirror another stream into this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<StreamSource>,
+    /// Additional streams whose subjects are sourced into this stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<StreamSource>>,
+    /// Republish rule: matching messages are re-published to a second subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub republish: Option<Republish>,
+    /// Single subject transform applied to all subjects stored on this stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_transform: Option<SubjectTransform>,
+    /// Cluster placement directives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -573,6 +588,74 @@ fn is_zero_i64(v: &i64) -> bool {
 
 fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// Source reference for mirror / sources stream configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamSource {
+    /// Name of the source stream.
+    pub name: String,
+    /// Start replicating from this sequence (inclusive). `None` = from the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_start_seq: Option<u64>,
+    /// Start replicating from this RFC 3339 timestamp. `None` = from the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_start_time: Option<String>,
+    /// Filter to a single subject (simple case; use `subject_transforms` for
+    /// multi-subject fan-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_subject: Option<String>,
+    /// Subject transforms applied to messages from this source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_transforms: Option<Vec<SubjectTransform>>,
+    /// External stream reference for hub-and-spoke / leaf-node topologies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalStream>,
+}
+
+/// Reference to a stream accessible through a leaf-node or account import.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExternalStream {
+    /// The JetStream API subject prefix used to reach the remote server.
+    pub api: String,
+    /// The delivery subject prefix for push consumers on the remote stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver: Option<String>,
+}
+
+/// Republish rule: messages whose subject matches `src` are re-published to `dest`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Republish {
+    /// Source subject filter (supports wildcards).
+    pub src: String,
+    /// Destination subject (tokens from `src` wildcards are substituted).
+    pub dest: String,
+    /// When `true` only headers are republished, not the payload.
+    #[serde(default)]
+    pub headers_only: bool,
+}
+
+/// Maps one subject pattern to another.
+/// Used in `StreamConfig::subject_transform` and `StreamSource::subject_transforms`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubjectTransform {
+    /// Source subject filter (supports wildcards). `None` matches everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
+    /// Destination subject template (use `{{wildcard(N)}}` tokens).
+    pub dest: String,
+}
+
+/// Directs the server to place a stream's leader in a specific cluster or
+/// on nodes with specific tags.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Placement {
+    /// Preferred cluster name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<String>,
+    /// Required server tags. All listed tags must be present on the chosen node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[non_exhaustive]

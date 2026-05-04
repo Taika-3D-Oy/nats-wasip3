@@ -119,6 +119,7 @@ impl KeyValue {
             allow_direct: true,
             allow_rollup_hdrs: true,
             allow_msg_ttl: config.allow_msg_ttl,
+            ..Default::default()
         };
 
         js.create_stream(&stream_config).await?;

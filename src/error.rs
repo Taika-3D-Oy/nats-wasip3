@@ -26,6 +26,8 @@ pub enum Error {
     /// The client's outbound write buffer is full (server is too slow).
     /// The message was NOT sent. Either drain pending messages or close.
     BufferFull,
+    /// Payload exceeds the server's advertised `max_payload` limit.
+    MaxPayloadExceeded { size: usize, max: usize },
     /// JSON serialization/deserialization error.
     Json(String),
     /// JetStream API error.
@@ -55,6 +57,9 @@ impl fmt::Display for Error {
             Error::NoResponders => write!(f, "no responders"),
             Error::Disconnected => write!(f, "disconnected"),
             Error::BufferFull => write!(f, "write buffer full"),
+            Error::MaxPayloadExceeded { size, max } => {
+                write!(f, "payload too large: {size} bytes exceeds server max {max}")
+            }
             Error::Json(msg) => write!(f, "json: {msg}"),
             #[cfg(feature = "jetstream")]
             Error::JetStream { code, description } => {

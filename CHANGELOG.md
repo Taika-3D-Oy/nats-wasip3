@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] – 2026-05-04
+
+### Added
+
+- **`Error::MaxPayloadExceeded { size, max }`** — `publish`, `publish_with_reply`,
+  and `publish_with_headers` now check the payload length against the server's
+  advertised `max_payload` limit before writing to the outbound buffer. A
+  payload that exceeds the limit is rejected immediately with
+  `Error::MaxPayloadExceeded` rather than being sent and causing the server to
+  close the connection with `-ERR 'Maximum Payload Violation'`.
+
+- **`ConnectConfig::no_echo: bool`** (default `false`) — when set to `true`
+  the NATS server will not echo messages published by this client back to its
+  own subscriptions. Wired through to the `echo` field in the `CONNECT`
+  payload. Previously `echo` was always sent as `true`.
+
+- **`StreamConfig` sourcing, mirroring and routing fields**:
+  - `mirror: Option<StreamSource>` — mirror another stream into this one.
+  - `sources: Option<Vec<StreamSource>>` — fan-in from multiple source streams.
+  - `republish: Option<Republish>` — re-publish matching messages to a second
+    subject without moving them.
+  - `subject_transform: Option<SubjectTransform>` — apply a single
+    subject-mapping rule to all messages stored on the stream.
+  - `placement: Option<Placement>` — direct the server to place the stream
+    leader in a specific cluster or on nodes with specific tags.
+
+- **New supporting types** (all in `nats_wasip3::jetstream`):
+  - `StreamSource` — source reference used by `mirror` / `sources`, with
+    `opt_start_seq`, `opt_start_time`, `filter_subject`,
+    `subject_transforms`, and `external` fields.
+  - `ExternalStream` — API/deliver prefix pair for leaf-node / account-import
+    topologies.
+  - `Republish` — `src` pattern, `dest` template, and `headers_only` flag.
+  - `SubjectTransform` — `src` filter and `dest` template (uses `{{wildcard(N)}}`
+    tokens as per the NATS server spec).
+  - `Placement` — `cluster` name and `tags` list.
+
+### Internal
+
+- Existing `StreamConfig` literals in `kv.rs` and `object_store.rs` updated to
+  use `..Default::default()` for forward-compatibility with the new optional
+  fields.
+
 ## [0.9.1] – 2026-04-30
 
 ### Fixed

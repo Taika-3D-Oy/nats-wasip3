@@ -148,6 +148,10 @@ pub struct ConnectConfig {
     /// Maximum number of bytes buffered for outbound writes. `publish()` returns
     /// `Err(Error::BufferFull)` when this limit is exceeded. Default: 8 MiB.
     pub max_pending_write_bytes: usize,
+    /// Disable echoing messages back to the publisher. When `true`, the server
+    /// will not deliver messages published by this client to its own
+    /// subscriptions. Default: `false`.
+    pub no_echo: bool,
 }
 
 impl Default for ConnectConfig {
@@ -171,6 +175,7 @@ impl Default for ConnectConfig {
             reconnect_delay: millis(250),
             subscription_capacity: 512,
             max_pending_write_bytes: 8 * 1024 * 1024,
+            no_echo: false,
         }
     }
 }
@@ -206,6 +211,8 @@ struct Inner {
     mailbox_capacity: usize,
     /// Maximum outbound write buffer in bytes.
     write_buf_limit: usize,
+    /// Server's advertised max_payload limit (0 = unlimited).
+    max_payload: usize,
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -347,6 +354,7 @@ impl Client {
             known_servers: info.connect_urls.clone(),
             mailbox_capacity: config.subscription_capacity,
             write_buf_limit: config.max_pending_write_bytes,
+            max_payload: info.max_payload,
         }));
 
         // ── Spawn read loop ────────────────────────────────────
@@ -381,6 +389,7 @@ impl Client {
     /// Publish a message.
     pub fn publish(&self, subject: &str, payload: &[u8]) -> Result<(), Error> {
         self.check_closed()?;
+        self.check_payload_size(payload.len())?;
         let data = proto::encode_pub(subject, None, payload)?;
         self.enqueue_write(&data)?;
         Ok(())
@@ -394,6 +403,7 @@ impl Client {
         payload: &[u8],
     ) -> Result<(), Error> {
         self.check_closed()?;
+        self.check_payload_size(payload.len())?;
         let data = proto::encode_pub(subject, Some(reply_to), payload)?;
         self.enqueue_write(&data)?;
         Ok(())
@@ -408,6 +418,7 @@ impl Client {
         payload: &[u8],
     ) -> Result<(), Error> {
         self.check_closed()?;
+        self.check_payload_size(payload.len())?;
         let data = proto::encode_hpub(subject, reply_to, headers, payload)?;
         self.enqueue_write(&data)?;
         Ok(())
@@ -616,6 +627,14 @@ impl Client {
         format!("_INBOX.{id}")
     }
 
+    fn check_payload_size(&self, len: usize) -> Result<(), Error> {
+        let max = self.inner.borrow().max_payload;
+        if max > 0 && len > max {
+            return Err(Error::MaxPayloadExceeded { size: len, max });
+        }
+        Ok(())
+    }
+
     fn enqueue_write(&self, data: &[u8]) -> Result<(), Error> {
         let mut inner = self.inner.borrow_mut();
         if inner.write_buf.len() + data.len() > inner.write_buf_limit {
@@ -660,6 +679,7 @@ fn build_connect_opts(
         auth_token: config.auth_token.clone(),
         jwt: config.jwt.clone(),
         tls_required: use_tls,
+        echo: !config.no_echo,
         ..Default::default()
     };
 

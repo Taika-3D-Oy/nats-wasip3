@@ -2,7 +2,7 @@
 
 [package]
 name = "nats-wasip3"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "NATS client for wasm32-wasip3 — native Component Model async I/O"
 license = "Apache-2.0"
@@ -20,8 +20,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # P3 raw bindings — native CM async sockets, clocks, streams, futures
-wasip3 = "0.5"
-wit-bindgen = { version = "0.54", default-features = false, features = ["async", "async-spawn", "macros"] }
+wasip3 = "0.6"
+wit-bindgen = { version = "0.57", default-features = false, features = ["async", "async-spawn", "macros"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 serde = { version = "1", features = ["derive"] }
