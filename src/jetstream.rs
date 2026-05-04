@@ -565,6 +565,16 @@ pub struct StreamConfig {
     /// Allow per-message TTL via the `Nats-TTL` header (NATS server 2.11+).
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_msg_ttl: bool,
+    /// Enable server-side message scheduling via `Nats-Schedule` headers
+    /// (NATS server 2.14+). When `true`, publishing a message with a
+    /// `Nats-Schedule` header causes the server to repeatedly re-publish it
+    /// to the `Nats-Schedule-Target` subject on the given schedule.
+    ///
+    /// Implicitly enables `allow_rollup_hdrs`. Cannot be set on mirror or
+    /// source streams. Once enabled it cannot be disabled.
+    /// See [`nats_wasip3::schedule`] for the client-side API.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_msg_schedules: bool,
     /// Mirror another stream into this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<StreamSource>,

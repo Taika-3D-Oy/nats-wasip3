@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] – 2026-05-04
+
+### Added
+
+- **Message scheduling support (NATS 2.14+, [ADR-51])** — new `nats_wasip3::schedule`
+  module (behind the existing `jetstream` feature flag):
+  - `Schedule` enum — `At(rfc3339)`, `Every(interval)`, `Cron(expr)`,
+    `Hourly`, `Daily`, `Weekly`, `Monthly`, `Yearly`; each variant's
+    `to_header_value()` returns the correct `Nats-Schedule` header value.
+  - `ScheduleSpec` — builder struct with `schedule`, `target`, `source`,
+    `ttl`, `time_zone`, and `rollup` fields. `to_headers()` returns a
+    ready-to-publish `Headers` map.
+  - `now_rfc3339() -> String` — current wall-clock time as RFC 3339 UTC,
+    via `wasi:clocks/system-clock`.
+  - `after_secs_rfc3339(delta_secs: u64) -> String` — wall-clock time
+    `delta_secs` seconds from now; convenient for one-shot delayed publishes.
+  - `format_rfc3339(unix_secs: u64, nanoseconds: u32) -> String` — public
+    RFC 3339 formatter for custom timestamps.
+  - All 8 schedule header name constants (`HEADER_SCHEDULE`,
+    `HEADER_SCHEDULE_TARGET`, `HEADER_SCHEDULE_SOURCE`,
+    `HEADER_SCHEDULE_TTL`, `HEADER_SCHEDULE_TIME_ZONE`,
+    `HEADER_SCHEDULE_ROLLUP`, `HEADER_SCHEDULER`, `HEADER_SCHEDULE_NEXT`).
+
+- **`StreamConfig::allow_msg_schedules: bool`** — new field wired to the
+  `allow_msg_schedules` JSON key required to enable message scheduling on a
+  stream. Serialized with `omitempty`; defaults to `false`.
+
+[ADR-51]: https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-51.md
+
 ## [0.10.0] – 2026-05-04
 
 ### Added
