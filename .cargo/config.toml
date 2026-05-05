@@ -6,7 +6,7 @@ runner = [
     "-W", "component-model=y",
     "-W", "component-model-async=y",
 ]
-rustflags = ["-C", "link-args=-z stack-size=8388608"]
+rustflags = ["-C", "link-args=-z stack-size=8388608 --allow-multiple-definition"]
 
 [unstable]
 build-std = ["std", "panic_abort"]

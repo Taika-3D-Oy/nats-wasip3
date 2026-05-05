@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.1] – 2026-05-05
+
+### Fixed
+
+- **Linker duplicate symbol with `build-std`**: Added `--allow-multiple-definition`
+  to `rustflags` in `.cargo/config.toml`. When building `cdylib` components with
+  `-Zbuild-std`, the `wasm32-wasip3` std and user code each compile their own copy
+  of `wit-bindgen`'s `cabi_realloc` static lib, causing a linker conflict. The flag
+  tells `wasm-ld` to accept the first definition (both are identical). Fixes binary
+  example builds (`cargo build --example pubsub`).
+
 ## [0.11.0] – 2026-05-04
 
 ### Added
