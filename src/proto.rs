@@ -81,7 +81,17 @@ impl Headers {
     }
 
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.entries.push((key.into(), value.into()));
+        let key = key.into();
+        let value = value.into();
+        // Sanitise: remove any CR or LF characters to prevent header injection.
+        // NATS header keys must not be empty or contain control characters;
+        // values follow the same rule. We strip rather than error so that
+        // internal callers (schedule, kv, jetstream) stay infallible.
+        let key = key.replace(['\r', '\n'], "");
+        let value = value.replace(['\r', '\n'], "");
+        if !key.is_empty() {
+            self.entries.push((key, value));
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -480,6 +490,42 @@ mod tests {
     fn headers_missing_key() {
         let h = Headers::new();
         assert_eq!(h.get("nope"), None);
+    }
+
+    #[test]
+    fn headers_inject_crlf_stripped_from_value() {
+        let mut h = Headers::new();
+        // A value containing \r\n must not produce extra header lines.
+        h.insert("X-Token", "legit\r\nX-Injected: evil");
+        let encoded = h.encode();
+        let s = std::str::from_utf8(&encoded).unwrap();
+        // "X-Injected:" must not appear as the start of a header line.
+        assert!(!s.contains("\r\nX-Injected:"), "header line was injected");
+        // The sanitised value should still be stored under the real key.
+        assert_eq!(h.get("X-Token"), Some("legitX-Injected: evil"));
+    }
+
+    #[test]
+    fn headers_inject_crlf_stripped_from_key() {
+        let mut h = Headers::new();
+        // A key containing \r\n must not corrupt the header block.
+        h.insert("Bad\r\nKey", "value");
+        let encoded = h.encode();
+        let s = std::str::from_utf8(&encoded).unwrap();
+        // The sanitised (stripped) key must not appear as a blank line
+        // or produce a stray header separator.
+        assert!(!s.contains("\r\n\r\n\r\n"), "extra blank line found");
+    }
+
+    #[test]
+    fn headers_empty_key_after_strip_is_dropped() {
+        let mut h = Headers::new();
+        // A key that becomes empty after stripping control chars is not inserted.
+        h.insert("\r\n", "value");
+        assert_eq!(h.get(""), None);
+        // encode() should still produce a valid, single-terminated block.
+        let encoded = h.encode();
+        assert_eq!(encoded, b"NATS/1.0\r\n\r\n");
     }
 
     #[test]
