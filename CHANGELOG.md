@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.2] – 2026-08-22
+
+### Changed
+
+- **wasmCloud 2.7.0 & WASI 0.3.0 Compatibility**:
+  - Upgraded to `wasip3 0.7` and `wit-bindgen 0.57`.
+  - Prevented socket resource drop traps by managing lifecycle of child stream futures.
+  - Aligned clock bindings with standard WASI `system-clock` interfaces.
+
 ## [0.11.1] – 2026-05-05
 
 ### Fixed

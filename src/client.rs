@@ -269,6 +269,8 @@ impl Client {
         let (mut rx, rx_fut) = socket.receive();
         let (tx, tx_rx) = wit_stream::new();
         let _send_fut = socket.send(tx_rx);
+        std::mem::forget(socket);
+        std::mem::forget(_send_fut);
 
         // ── Read INFO ──────────────────────────────────────────
         let mut buf = Vec::new();
@@ -1036,6 +1038,9 @@ async fn attempt_reconnect(
         let (mut rx, _rx_fut) = socket.receive();
         let (tx, tx_rx) = wit_stream::new();
         let _send_fut = socket.send(tx_rx);
+        std::mem::forget(socket);
+        std::mem::forget(_rx_fut);
+        std::mem::forget(_send_fut);
 
         // Read INFO.
         let mut buf = Vec::new();
