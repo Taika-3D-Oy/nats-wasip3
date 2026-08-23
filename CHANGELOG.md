@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.3] – 2026-08-23
+
+### Fixed
+
+- **JetStream `fetch()` Pull Batch Completion**:
+  - Inspected `Nats-Pending-Messages: 0` / `Nats-Num-Pending: 0` / `Nats-Pending: 0` headers on delivered messages in pull batches (`no_wait: true`) to complete fetches immediately instead of waiting for full API timeout.
+  - Reduced subsequent message wait timeout to 100ms once initial messages in a `no_wait` batch have arrived.
+
 ## [0.11.2] – 2026-08-22
 
 ### Changed

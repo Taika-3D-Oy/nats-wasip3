@@ -224,8 +224,18 @@ impl JetStream {
             .publish_with_headers(&subject, Some(&inbox), &Headers::new(), &payload)?;
 
         let mut messages = Vec::new();
-        let timeout = js_api_timeout();
+        // First message can take up to js_api_timeout(), but subsequent messages
+        // in a no_wait batch arrive in immediate succession.
+        let first_timeout = js_api_timeout();
+        let subsequent_timeout = crate::client::millis(100);
+
         loop {
+            let timeout = if messages.is_empty() {
+                first_timeout
+            } else {
+                subsequent_timeout
+            };
+
             let msg = match with_timeout(timeout, sub.next()).await {
                 Ok(Ok(msg)) => msg,
                 Ok(Err(e)) => return Err(e), // subscription error (disconnected etc.)
@@ -239,8 +249,17 @@ impl JetStream {
                     }
                 }
             }
+
+            let is_last = msg.headers.as_ref().map_or(false, |h| {
+                h.get("Nats-Pending-Messages")
+                    .or_else(|| h.get("Nats-Pending"))
+                    .or_else(|| h.get("Nats-Num-Pending"))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    == Some(0)
+            });
+
             messages.push(msg);
-            if messages.len() >= batch as usize {
+            if is_last || messages.len() >= batch as usize {
                 break;
             }
         }
