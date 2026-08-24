@@ -11,20 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly with wasm32-wasip3
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust stable with wasm32-wasip2
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: rust-src
-
-      - name: Install wasm32-wasip2 target (source libc/CRT)
-        run: rustup target add wasm32-wasip2
-
-      - name: Bootstrap wasm32-wasip3 sysroot (libc/CRT)
-        run: |
-          WASIP2_SC="$(rustc --print sysroot)/lib/rustlib/wasm32-wasip2/lib/self-contained"
-          WASIP3_SC="$(rustc --print sysroot)/lib/rustlib/wasm32-wasip3/lib/self-contained"
-          mkdir -p "$WASIP3_SC"
-          cp "$WASIP2_SC"/* "$WASIP3_SC"/
+          targets: wasm32-wasip2
 
       - name: Publish to crates.io
         run: cargo publish
