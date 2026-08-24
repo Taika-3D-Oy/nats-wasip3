@@ -41,9 +41,9 @@ All notable changes to this project will be documented in this file.
   on every push and pull request:
   - `test` — runs `cargo test --lib` on the native host (stable Rust,
     `x86_64-unknown-linux-gnu`) covering protocol, nkey, kv, and client unit
-    tests without needing wasmtime or the `wasm32-wasip3` nightly component.
-  - `check` — runs `cargo check --all-features --target wasm32-wasip3` using
-    nightly to catch regressions against the primary target.
+    tests without needing wasmtime.
+  - `check` — runs `cargo check --all-features` and `cargo check --examples` targeting
+    `wasm32-wasip2` using stable Rust to catch regressions against the primary target.
 
 - **New unit tests** for all fixes:
   - `proto::tests::headers_inject_crlf_stripped_from_value` — verifies that a

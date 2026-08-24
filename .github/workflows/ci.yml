@@ -18,35 +18,29 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # The crate targets wasm32-wasip3 for production use, but the unit tests
-      # in proto, nkey, kv, and client modules are host-compatible (they don't
-      # call WASI interfaces at runtime). Running them on the native host gives
-      # fast feedback on protocol logic, nkey auth, and header handling without
-      # needing wasmtime or the wasm32-wasip3 nightly component.
+      # The crate targets wasm32-wasip2 for WASI 0.3 / Component Model runtime use,
+      # but the unit tests in proto, nkey, kv, and client modules are host-compatible
+      # (they don't call WASI socket/clock interfaces at runtime). Running them on
+      # the native host gives fast feedback on protocol logic, nkey auth, and header
+      # handling without needing wasmtime.
       - name: Run unit tests
         run: |
           cargo test --lib --target x86_64-unknown-linux-gnu \
             -- proto nkey kv client
 
   check:
-    name: Check (wasm32-wasip3)
+    name: Check (wasm32-wasip2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly with wasm32-wasip3
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust stable with wasm32-wasip2
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: rust-src
-          targets: wasm32-wasip3
-
-      - name: Bootstrap wasm32-wasip3 sysroot (libc/CRT from wasip2)
-        run: |
-          rustup target add wasm32-wasip2
-          WASIP2_SC="$(rustc --print sysroot)/lib/rustlib/wasm32-wasip2/lib/self-contained"
-          WASIP3_SC="$(rustc --print sysroot)/lib/rustlib/wasm32-wasip3/lib/self-contained"
-          mkdir -p "$WASIP3_SC"
-          cp "$WASIP2_SC"/* "$WASIP3_SC"/
+          targets: wasm32-wasip2
 
       - name: cargo check (all features)
-        run: cargo check --all-features --target wasm32-wasip3
+        run: cargo check --all-features --target wasm32-wasip2
+
+      - name: cargo check examples (cdylib)
+        run: cargo check --examples --all-features --target wasm32-wasip2
