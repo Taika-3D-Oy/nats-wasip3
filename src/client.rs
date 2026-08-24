@@ -201,6 +201,9 @@ struct Inner {
     /// Woken when a PONG arrives — used by Client::flush().
     pong_waker: Option<Waker>,
     next_id: u64,
+    /// Xorshift64 state for pseudo-random inbox tokens and jitter.
+    /// Seeded from the monotonic clock at connection time.
+    rng: u64,
     closed: bool,
     close_error: Option<String>,
     /// Set by reconnect logic; picked up by the flush loop.
@@ -274,8 +277,11 @@ impl Client {
 
         // ── Read INFO ──────────────────────────────────────────
         let mut buf = Vec::new();
+        let mut scratch = Vec::with_capacity(8192);
         let info = loop {
-            if stream_read(&mut rx, &mut buf).await == 0 && buf.is_empty() {
+            let (n, s) = stream_read(&mut rx, &mut buf, scratch).await;
+            scratch = s;
+            if n == 0 && buf.is_empty() {
                 return Err(Error::Disconnected);
             }
             if let Some((op, consumed)) = proto::parse_op(&buf)? {
@@ -326,7 +332,9 @@ impl Client {
 
         // ── Wait for PONG ──────────────────────────────────────
         loop {
-            if stream_read(&mut rx, &mut buf).await == 0 && buf.is_empty() {
+            let (n, s) = stream_read(&mut rx, &mut buf, scratch).await;
+            scratch = s;
+            if n == 0 && buf.is_empty() {
                 return Err(Error::Disconnected);
             }
             if let Some((op, consumed)) = proto::parse_op(&buf)? {
@@ -343,6 +351,10 @@ impl Client {
         }
 
         // ── Shared state ───────────────────────────────────────
+        // Seed the PRNG from the monotonic clock; XOR with a fixed salt so
+        // that a zero clock reading still produces a valid non-zero state.
+        let rng_seed = wasip3::clocks::monotonic_clock::now() ^ 0xcafe_babe_dead_beef;
+
         let inner = Rc::new(RefCell::new(Inner {
             mailboxes: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -350,6 +362,7 @@ impl Client {
             flush_waker: None,
             pong_waker: None,
             next_id: 1,
+            rng: rng_seed,
             closed: false,
             close_error: None,
             new_writer: None,
@@ -624,9 +637,9 @@ impl Client {
 
     pub(crate) fn new_inbox(&self) -> String {
         let mut inner = self.inner.borrow_mut();
-        let id = inner.next_id;
-        inner.next_id += 1;
-        format!("_INBOX.{id}")
+        let r1 = xorshift64(&mut inner.rng);
+        let r2 = xorshift64(&mut inner.rng);
+        format!("_INBOX.{r1:016x}{r2:016x}")
     }
 
     fn check_payload_size(&self, len: usize) -> Result<(), Error> {
@@ -794,16 +807,17 @@ async fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
     }
 }
 
-/// Read from a P3 `StreamReader<u8>`, appending to `buf`. Returns bytes read.
-async fn stream_read(rx: &mut StreamReader<u8>, buf: &mut Vec<u8>) -> usize {
-    let read_buf = Vec::with_capacity(8192);
-    let (status, data) = rx.read(read_buf).await;
+/// Read from a P3 `StreamReader<u8>`, appending to `buf`. Returns `(bytes_read, scratch)`.
+/// The caller should pass the returned `scratch` back on the next call to reuse the allocation.
+async fn stream_read(rx: &mut StreamReader<u8>, buf: &mut Vec<u8>, scratch: Vec<u8>) -> (usize, Vec<u8>) {
+    let (status, mut data) = rx.read(scratch).await;
     match status {
         StreamResult::Complete(n) => {
             buf.extend_from_slice(&data[..n]);
-            n
+            data.clear();
+            (n, data)
         }
-        StreamResult::Dropped | StreamResult::Cancelled => 0,
+        StreamResult::Dropped | StreamResult::Cancelled => (0, data),
     }
 }
 
@@ -916,6 +930,7 @@ async fn read_loop(
     config: ConnectConfig,
 ) {
     let mut buf = leftover;
+    let mut scratch = Vec::with_capacity(8192);
 
     loop {
         // Exit if the client was closed (all user clones dropped).
@@ -924,7 +939,8 @@ async fn read_loop(
         }
 
         let prev_len = buf.len();
-        stream_read(&mut reader, &mut buf).await;
+        let (_, s) = stream_read(&mut reader, &mut buf, scratch).await;
+        scratch = s;
 
         // Re-check after await — client may have been closed while we waited.
         if inner.borrow().closed {
@@ -1006,6 +1022,8 @@ async fn attempt_reconnect(
         v
     };
     let ncandidates = candidates.len().max(1);
+    // Reusable read buffer shared across reconnect attempts.
+    let mut reconnect_scratch = Vec::with_capacity(8192);
 
     for attempt in 0..max {
         wasip3::clocks::monotonic_clock::wait_for(delay).await;
@@ -1013,9 +1031,10 @@ async fn attempt_reconnect(
             return None;
         }
         delay = if delay + delay < cap { delay + delay } else { cap };
-        // Add ±25% jitter to spread out reconnection storms.
+        // Add ±25% jitter using the PRNG to spread out reconnection storms.
         let jitter_range = delay / 4;
-        let jitter_offset = (delay.wrapping_mul(0x9e3779b97f4a7c15) >> 32) % jitter_range.max(1);
+        let rand_val = xorshift64(&mut inner.borrow_mut().rng);
+        let jitter_offset = rand_val % jitter_range.max(1);
         delay = delay.saturating_sub(jitter_range / 2).saturating_add(jitter_offset);
 
         let addr = candidates[attempt as usize % ncandidates].clone();
@@ -1046,7 +1065,8 @@ async fn attempt_reconnect(
         let mut buf = Vec::new();
         let info = loop {
             let prev = buf.len();
-            stream_read(&mut rx, &mut buf).await;
+            let (_, s) = stream_read(&mut rx, &mut buf, reconnect_scratch).await;
+            reconnect_scratch = s;
             if buf.len() == prev {
                 break None;
             }
@@ -1115,7 +1135,8 @@ async fn attempt_reconnect(
         let mut got_pong = false;
         'pong: for _ in 0..50 {
             let prev = buf.len();
-            stream_read(&mut rx, &mut buf).await;
+            let (_, s) = stream_read(&mut rx, &mut buf, reconnect_scratch).await;
+            reconnect_scratch = s;
             if buf.len() == prev {
                 break;
             }
@@ -1201,6 +1222,19 @@ fn is_permanent_auth_error(msg: &str) -> bool {
         || m.contains("authentication revoked")
         || m.contains("user authentication expired")
         || m.contains("user authentication revoked")
+}
+
+/// Xorshift64 PRNG — advances `state` and returns the next pseudo-random u64.
+/// `state` must never be 0; the seed initialisation in `Inner` guarantees this
+/// via the XOR with a non-zero salt.
+#[inline]
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
 }
 
 // ── Dispatch & helpers ─────────────────────────────────────────────
@@ -1341,4 +1375,41 @@ impl<'a> Future for FlushWait<'a> {
             Poll::Pending
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+use super::xorshift64;
+
+#[test]
+fn xorshift64_never_repeats_in_short_run() {
+    let mut state = 0xcafe_babe_dead_beef_u64;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1_000 {
+        let v = xorshift64(&mut state);
+        assert!(seen.insert(v), "xorshift64 produced a duplicate in the first 1000 outputs");
+    }
+}
+
+#[test]
+fn xorshift64_nonzero_seed_stays_nonzero() {
+    let mut state = 1u64;
+    for _ in 0..100 {
+        let v = xorshift64(&mut state);
+        assert_ne!(v, 0, "xorshift64 must never output 0 given a valid seed");
+    }
+}
+
+#[test]
+fn inbox_format_is_32_hex_chars() {
+    // Verify the _INBOX. prefix + exactly 32 hex characters (two u64s).
+    let mut rng = 0x1234_5678_9abc_def0_u64;
+    let r1 = xorshift64(&mut rng);
+    let r2 = xorshift64(&mut rng);
+    let inbox = format!("_INBOX.{r1:016x}{r2:016x}");
+    assert!(inbox.starts_with("_INBOX."), "wrong prefix");
+    let token = &inbox["_INBOX.".len()..];
+    assert_eq!(token.len(), 32, "token should be 32 hex chars");
+    assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in token");
+}
 }

@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security
+
+- **Header injection prevention**: `Headers::insert` now strips `\r` and `\n`
+  characters from both keys and values before storing them. A key that becomes
+  empty after stripping is silently dropped. This prevents crafted user input
+  from injecting extra NATS header lines into an `HPUB` frame.
+
+### Fixed
+
+- **Randomised inbox subjects**: `Client::new_inbox()` now generates
+  `_INBOX.<32-hex-chars>` using a Xorshift64 PRNG seeded from the monotonic
+  clock at connection time. Previously inboxes were sequential integers
+  (`_INBOX.1`, `_INBOX.2`, …), which allowed any subscriber on the same server
+  to predict and intercept request/reply traffic via `_INBOX.>`.
+
+- **True jitter for reconnect backoff**: The ±25% jitter applied during
+  reconnection now uses the same Xorshift64 PRNG seeded from the connection
+  clock. Previously a deterministic `wrapping_mul` hash was used, meaning all
+  clients that connected at the same time produced identical backoff sequences,
+  defeating the thundering-herd prevention.
+
+- **Eliminate per-read allocation in `stream_read`**: The internal
+  `stream_read` helper previously allocated a fresh `Vec::with_capacity(8192)`
+  on every call. The read buffer is now threaded through callers in tight loops
+  (`read_loop`, `attempt_reconnect`) so the allocation is made once and reused
+  across reads.
+
+- **Dead code warning in `object_store`**: The local `format_rfc3339` wrapper
+  was only called from unit tests; it is now conditionally compiled with
+  `#[cfg(test)]`.
+
+### Added
+
+- **CI workflow** (`.github/workflows/ci.yml`): Two new jobs run automatically
+  on every push and pull request:
+  - `test` — runs `cargo test --lib` on the native host (stable Rust,
+    `x86_64-unknown-linux-gnu`) covering protocol, nkey, kv, and client unit
+    tests without needing wasmtime.
+  - `check` — runs `cargo check --all-features` and `cargo check --examples` targeting
+    `wasm32-wasip2` using stable Rust to catch regressions against the primary target.
+
+- **New unit tests** for all fixes:
+  - `proto::tests::headers_inject_crlf_stripped_from_value` — verifies that a
+    value with embedded `\r\n` cannot inject a new header line.
+  - `proto::tests::headers_inject_crlf_stripped_from_key` — verifies key
+    sanitisation.
+  - `proto::tests::headers_empty_key_after_strip_is_dropped` — verifies that a
+    key reduced to empty by stripping is not stored.
+  - `client::tests::xorshift64_never_repeats_in_short_run` — Xorshift64 PRNG
+    property test.
+  - `client::tests::xorshift64_nonzero_seed_stays_nonzero` — verifies the PRNG
+    never outputs 0 from a valid seed.
+  - `client::tests::inbox_format_is_32_hex_chars` — verifies inbox subject
+    format.
+
 ## [0.11.3] – 2026-08-24
 
 ### Changed
