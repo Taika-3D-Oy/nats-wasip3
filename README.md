@@ -1,91 +1,48 @@
 # nats-wasip3
 
-A NATS client for `wasm32-wasip3` — core pub/sub, JetStream (including Object
-Store), and KV with
-CAS. Uses **native WASI P3 Component Model async I/O** (`wasip3` crate +
-`wit-bindgen`) — no wstd shim, no C/FFI dependencies.
+A NATS client for WASI 0.3 / Component Model — core pub/sub, JetStream (including Object
+Store), and KV with CAS. Uses **native WASI 0.3 Component Model async I/O** (`wasip3` crate +
+`wit-bindgen`) — no wstd shim, no C/FFI dependencies, builds with stable Rust.
 
 ## Requirements
 
-- **Rust nightly** (the `wasm32-wasip3` target is Tier 3)
-- **`rust-src`** component (`rustup component add rust-src`)
-- **`wasm-component-ld`** (`cargo install wasm-component-ld`)
-- **`wasm32-wasip2` target** (for the CRT/libc sysroot — see below)
-- **wasmtime ≥ 45** built from git main via `cargo install` (for P3 / component-model-async)
+- **Rust stable ≥ 1.85** with the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
+- **Runtime**: [wasmCloud](https://wasmcloud.com) ≥ 2.7.0, or [Wasmtime](https://wasmtime.dev) ≥ 47 (with WASI 0.3 / component-model-async support)
 - **nats-server** (for running tests)
 
-The included `rust-toolchain.toml` pins the nightly toolchain and `rust-src`
-automatically.
-
-### Install wasmtime from git
-
-You need the latest from the git main branch:
-
-```sh
-cargo install wasmtime-cli --git https://github.com/bytecodealliance/wasmtime --locked
-```
-
-This installs to `~/.cargo/bin/wasmtime`. The `.cargo/config.toml` in this
-repo already points the runner there. Verify:
-
-```sh
-~/.cargo/bin/wasmtime --version
-# wasmtime 45.0.0 or later
-```
-
-### Sysroot setup (one-time)
-
-Since `wasm32-wasip3` is Tier 3, the pre-built CRT and libc aren't shipped.
-Copy them from the wasip2 sysroot:
-
-```sh
-rustup +nightly target add wasm32-wasip2
-
-WASIP2_SC=$(rustc +nightly --print sysroot)/lib/rustlib/wasm32-wasip2/lib/self-contained
-WASIP3_SC=$(rustc +nightly --print sysroot)/lib/rustlib/wasm32-wasip3/lib/self-contained
-mkdir -p "$WASIP3_SC"
-cp "$WASIP2_SC"/* "$WASIP3_SC/"
-```
-
-This is needed for linking binaries and examples. Library-only builds work
-without this step. **Repeat this after every `rustup update`**, since the
-sysroot directory changes with each nightly version.
+The included `rust-toolchain.toml` pins the stable toolchain and `wasm32-wasip2` target automatically. WASI 0.3 Component Model async I/O compiles directly with stable Rust using the `wasip3` (0.7+) and `wit-bindgen` (0.57+) crates.
 
 ## Building
 
 ```sh
-# Library only:
-cargo build --target wasm32-wasip3 --lib
+# Library build:
+cargo build --lib
 
-# Examples / binaries (requires sysroot setup above):
-cargo build --target wasm32-wasip3 --example pubsub
+# Examples / binaries:
+cargo build --example pubsub
 
 # All features including TLS:
-cargo build --target wasm32-wasip3 --all-features
+cargo build --all-features
 ```
 
-The `.cargo/config.toml` already configures `build-std` and the 8 MB stack
-size for the `wasm32-wasip3` target.
+The `.cargo/config.toml` defaults the build target to `wasm32-wasip2` and configures the stack size.
 
 ## Running
 
-The cargo runner in `.cargo/config.toml` is set to
-`~/.cargo/bin/wasmtime run` with the required P3 flags. You can run
-components directly:
+You can run components directly using Wasmtime (≥ 47):
 
 ```sh
-~/.cargo/bin/wasmtime run \
-    -S p3=y -S inherit-network=y \
-    -W component-model=y -W component-model-async=y \
+wasmtime run \
+    -S inherit-network=y \
+    -W component-model-async=y \
     --env NATS_URL=127.0.0.1:4222 \
-    target/wasm32-wasip3/debug/examples/pubsub.wasm
+    target/wasm32-wasip2/debug/examples/pubsub.wasm
 ```
 
 Key flags:
-- `-S p3=y` — enable WASI P3 APIs
 - `-S inherit-network=y` — give the guest access to the host network
-- `-W component-model=y -W component-model-async=y` — enable component model with async support
-- `-S tls=y` — enable `wasi:tls` host interface (only needed with `--features tls`)
+- `-W component-model-async=y` — enable component model async execution
+- `-S tls=y` — enable `wasi:tls` host interface (only needed when built with `--features tls`)
 
 ## Integration tests
 
@@ -100,21 +57,19 @@ nats-server -js -p 14222 &
 ### 2. Build and run
 
 ```sh
-cargo build --target wasm32-wasip3 --example integration_tests
-~/.cargo/bin/wasmtime run \
-    -S p3=y -S inherit-network=y \
-    -W component-model=y -W component-model-async=y \
+cargo build --example integration_tests
+wasmtime run \
+    -S inherit-network=y \
+    -W component-model-async=y \
     --env NATS_URL=127.0.0.1:14222 \
-    target/wasm32-wasip3/debug/examples/integration_tests.wasm
+    target/wasm32-wasip2/debug/examples/integration_tests.wasm
 ```
 
 This runs ~38 tests (core pub/sub, JetStream, KV).
 
 ### TLS tests (optional, experimental)
 
-TLS uses the `wasi:tls` host interface (`wasi:tls@0.3.0-draft`). The spec
-is still a draft — **custom CA certificates are not yet supported** by any
-host runtime, so TLS currently only works with publicly trusted certs.
+TLS uses the `wasi:tls` host interface (`wasi:tls@0.3.0`).
 
 To run TLS tests with a locally-trusted server:
 
@@ -124,20 +79,18 @@ nats-server -js -p 4223 \
     --tls --tlscert testdata/server-cert.pem --tlskey testdata/server-key.pem &
 
 # Build with TLS feature:
-cargo build --target wasm32-wasip3 --example integration_tests --features tls
+cargo build --example integration_tests --features tls
 
 # Run with TLS enabled in wasmtime:
-~/.cargo/bin/wasmtime run \
-    -S p3=y -S inherit-network=y -S tls=y \
-    -W component-model=y -W component-model-async=y \
+wasmtime run \
+    -S inherit-network=y -S tls=y \
+    -W component-model-async=y \
     --env NATS_URL=127.0.0.1:14222 \
     --env NATS_TLS_URL=127.0.0.1:4223 \
-    target/wasm32-wasip3/debug/examples/integration_tests.wasm
+    target/wasm32-wasip2/debug/examples/integration_tests.wasm
 ```
 
-> **Note:** TLS tests will fail with `UnknownIssuer` unless the server
-> certificate is signed by a publicly trusted CA. wasmtime's default TLS
-> provider uses `webpki-roots` with no way to add custom trust anchors yet.
+> **Note:** TLS tests require the server certificate to be trusted by the host TLS provider (e.g. `webpki-roots`).
 
 ## Feature flags
 

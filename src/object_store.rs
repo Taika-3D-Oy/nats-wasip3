@@ -461,6 +461,7 @@ fn now_rfc3339() -> String {
     crate::schedule::now_rfc3339()
 }
 
+#[cfg(test)]
 fn format_rfc3339(secs: u64, nanos: u32) -> String {
     crate::schedule::format_rfc3339(secs, nanos)
 }

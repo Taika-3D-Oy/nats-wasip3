@@ -1,12 +1,10 @@
-[target.wasm32-wasip3]
+[build]
+target = "wasm32-wasip2"
+
+[target.wasm32-wasip2]
 runner = [
-    "~/.cargo/bin/wasmtime", "run",
-    "-S", "p3=y",
+    "wasmtime", "run",
     "-S", "inherit-network=y",
-    "-W", "component-model=y",
     "-W", "component-model-async=y",
 ]
 rustflags = ["-C", "link-args=-z stack-size=8388608 --allow-multiple-definition"]
-
-[unstable]
-build-std = ["std", "panic_abort"]

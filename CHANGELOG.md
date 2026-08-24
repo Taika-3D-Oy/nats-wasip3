@@ -2,7 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.11.3] – 2026-08-23
+## [0.11.3] – 2026-08-24
+
+### Changed
+
+- **Stable Rust & WASI 0.3 Build Support**:
+  - Migrated build toolchain from nightly `wasm32-wasip3` to stable Rust targeting `wasm32-wasip2`.
+  - Removed nightly Tier 3 sysroot copy workarounds.
+  - Standardized runtime requirement to Wasmtime ≥ 47 / wasmCloud ≥ 2.7.0.
 
 ### Fixed
 
