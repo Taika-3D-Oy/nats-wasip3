@@ -58,16 +58,21 @@ pub async fn tls_upgrade(
     Ok((cleartext_from_net, cleartext_tx))
 }
 
-/// Forward all data from a StreamReader to a StreamWriter.
+/// Forward all data from a StreamReader to a StreamWriter without allocating per loop.
 async fn forward_stream(mut rx: StreamReader<u8>, mut tx: StreamWriter<u8>) {
+    let mut buf = Vec::with_capacity(16384);
     loop {
-        let buf = Vec::with_capacity(16384);
         let (status, data) = rx.read(buf).await;
         match status {
             wit_bindgen::StreamResult::Complete(n) if n > 0 => {
-                let remaining = tx.write_all(data[..n].to_vec()).await;
+                let remaining = tx.write_all(data).await;
                 if !remaining.is_empty() {
                     break;
+                }
+                // write_all returns empty Vec on complete write; reuse buffer.
+                buf = remaining;
+                if buf.capacity() < 16384 {
+                    buf.reserve(16384 - buf.capacity());
                 }
             }
             _ => break,

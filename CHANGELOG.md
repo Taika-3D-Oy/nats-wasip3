@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.5] – 2026-08-28
+
+### Changed
+
+- **Multiplexed Request-Reply Inbox**: Requests now share a single multiplexed inbox subscription (`_INBOX.<client_id>.*`) established at connection time instead of creating dynamic `SUB`/`UNSUB` subscriptions per request. This reduces wire protocol traffic per request by 66% (from 3 frames to 1 frame).
+- **RAII Request Future Cleanup**: `RequestFuture` now implements `Drop` to automatically remove pending request routing slots on completion, timeout, or cancellation, preventing memory leaks in high-throughput workloads.
+- **Concurrent `flush()` Tracking**: Replaced single `pong_waker` with cumulative PONG counter and waker queue, allowing multiple async tasks to call `flush()` concurrently without waker overwrites or deadlocks.
+
+### Fixed
+
+- **Host Socket Lifecycle**: Preserved active `TcpSocket` in client state and dropped it explicitly on `Client::close` / `Client::drop` to prevent host file descriptor leaks.
+- **Background Future Draining**: Replaced `std::mem::forget` on send and receive futures with explicit background drains via `wit_bindgen::spawn`.
+- **Zero-Copy Outbound Streaming & Disconnect Requeueing**: `stream_write_vec` avoids cloning data vectors, and `flush_loop` preserves unwritten bytes upon disconnect, requeueing them automatically so outbound data is never lost during reconnects.
+- **Zero-Allocation TLS Forwarding**: `forward_stream` in `tls.rs` now reuses a single 16 KB buffer across iterations instead of allocating per loop.
+
+### Added
+
+- **Unit tests**: Added tests for multiplexed inbox dispatch, RAII cancellation slot cleanup, and concurrent PONG sequence tracking.
+
 ## [0.11.4] – 2026-08-24
 
 ### Security

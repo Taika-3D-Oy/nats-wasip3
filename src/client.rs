@@ -193,13 +193,27 @@ struct Mailbox {
     waker: Option<Waker>,
 }
 
+struct RequestSlot {
+    response: Option<Message>,
+    waker: Option<Waker>,
+}
+
 struct Inner {
+    /// Active host TCP socket resource, kept alive so it is not dropped prematurely,
+    /// and dropped on close to release host file descriptors.
+    _socket: Option<TcpSocket>,
     mailboxes: HashMap<String, Mailbox>,
     subscriptions: HashMap<String, SubInfo>,
+    /// Pending multiplexed request-reply slots keyed by unique token.
+    pending_requests: HashMap<String, RequestSlot>,
+    /// Unique prefix for multiplexed request-reply inbox: `_INBOX.<unique>.`
+    inbox_prefix: String,
     write_buf: Vec<u8>,
     flush_waker: Option<Waker>,
-    /// Woken when a PONG arrives — used by Client::flush().
-    pong_waker: Option<Waker>,
+    /// Wakers for tasks waiting for a PONG in `Client::flush()`.
+    pong_wakers: Vec<Waker>,
+    /// Cumulative count of PONGs received since connection start.
+    pongs_received: u64,
     next_id: u64,
     /// Xorshift64 state for pseudo-random inbox tokens and jitter.
     /// Seeded from the monotonic clock at connection time.
@@ -246,10 +260,11 @@ impl Drop for Client {
         let n = self.refcount.get() - 1;
         self.refcount.set(n);
         if n == 0 {
-            // Last user clone dropped — shut down background loops.
+            // Last user clone dropped — shut down background loops and drop host socket.
             let mut inner = self.inner.borrow_mut();
             if !inner.closed {
                 inner.closed = true;
+                inner._socket = None;
                 wake_all(&mut inner);
             }
         }
@@ -271,9 +286,7 @@ impl Client {
         // P3: receive() and send() can each be called at most once.
         let (mut rx, rx_fut) = socket.receive();
         let (tx, tx_rx) = wit_stream::new();
-        let _send_fut = socket.send(tx_rx);
-        std::mem::forget(socket);
-        std::mem::forget(_send_fut);
+        let send_fut = socket.send(tx_rx);
 
         // ── Read INFO ──────────────────────────────────────────
         let mut buf = Vec::new();
@@ -324,9 +337,30 @@ impl Client {
             (rx, tx)
         };
 
-        // ── Send CONNECT + PING ────────────────────────────────
+        // ── Shared state setup ─────────────────────────────────
+        // Seed the PRNG from the monotonic clock; XOR with a fixed salt so
+        // that a zero clock reading still produces a valid non-zero state.
+        let mut rng = wasip3::clocks::monotonic_clock::now() ^ 0xcafe_babe_dead_beef;
+        let r1 = xorshift64(&mut rng);
+        let r2 = xorshift64(&mut rng);
+        let inbox_prefix = format!("_INBOX.{r1:016x}{r2:016x}.");
+        let mux_subject = format!("{inbox_prefix}*");
+        let mux_sid = "0".to_string();
+
+        let mut subscriptions = HashMap::new();
+        subscriptions.insert(
+            mux_sid.clone(),
+            SubInfo {
+                subject: mux_subject.clone(),
+                queue: None,
+            },
+        );
+
+        // ── Send CONNECT + multiplexed inbox SUB + PING ────────
         let connect_opts = build_connect_opts(&config, &info, use_tls)?;
         let mut handshake = proto::encode_connect(&connect_opts);
+        let mux_sub = proto::encode_sub(&mux_subject, &mux_sid)?;
+        handshake.extend_from_slice(&mux_sub);
         handshake.extend_from_slice(proto::PING);
         stream_write_all(&mut tx, &handshake).await?;
 
@@ -350,19 +384,18 @@ impl Client {
             }
         }
 
-        // ── Shared state ───────────────────────────────────────
-        // Seed the PRNG from the monotonic clock; XOR with a fixed salt so
-        // that a zero clock reading still produces a valid non-zero state.
-        let rng_seed = wasip3::clocks::monotonic_clock::now() ^ 0xcafe_babe_dead_beef;
-
         let inner = Rc::new(RefCell::new(Inner {
+            _socket: Some(socket),
             mailboxes: HashMap::new(),
-            subscriptions: HashMap::new(),
+            subscriptions,
+            pending_requests: HashMap::new(),
+            inbox_prefix,
             write_buf: Vec::new(),
             flush_waker: None,
-            pong_waker: None,
+            pong_wakers: Vec::new(),
+            pongs_received: 0,
             next_id: 1,
-            rng: rng_seed,
+            rng,
             closed: false,
             close_error: None,
             new_writer: None,
@@ -371,6 +404,11 @@ impl Client {
             write_buf_limit: config.max_pending_write_bytes,
             max_payload: info.max_payload,
         }));
+
+        // Drain send future in background so it does not leak.
+        wit_bindgen::spawn(async move {
+            let _ = send_fut.await;
+        });
 
         // ── Spawn read loop ────────────────────────────────────
         {
@@ -497,7 +535,7 @@ impl Client {
         })
     }
 
-    /// Send a request and wait for a single reply.
+    /// Send a request and wait for a single reply using the shared multiplexed inbox.
     pub async fn request(
         &self,
         subject: &str,
@@ -505,34 +543,32 @@ impl Client {
         timeout: Duration,
     ) -> Result<Message, Error> {
         self.check_closed()?;
-        let inbox = self.new_inbox();
-        let sid = self.next_sid();
+        self.check_payload_size(payload.len())?;
 
-        let mut batch = Vec::new();
-        batch.extend_from_slice(&proto::encode_sub(&inbox, &sid)?);
-        batch.extend_from_slice(&proto::encode_unsub(&sid, Some(1)));
-        batch.extend_from_slice(&proto::encode_pub(subject, Some(&inbox), payload)?);
-
-        {
+        let (token, reply_to) = {
             let mut inner = self.inner.borrow_mut();
-            inner.mailboxes.insert(
-                sid.clone(),
-                Mailbox {
-                    queue: VecDeque::new(),
+            let r = xorshift64(&mut inner.rng);
+            let token = format!("{r:016x}");
+            let reply_to = format!("{}{token}", inner.inbox_prefix);
+            inner.pending_requests.insert(
+                token.clone(),
+                RequestSlot {
+                    response: None,
                     waker: None,
                 },
             );
-        }
-        self.enqueue_write(&batch)?;
+            (token, reply_to)
+        };
+
+        let data = proto::encode_pub(subject, Some(&reply_to), payload)?;
+        self.enqueue_write(&data)?;
 
         let reply_fut = RequestFuture {
-            sid: sid.clone(),
+            token: token.clone(),
             inner: Rc::clone(&self.inner),
         };
 
         let result = with_timeout(timeout, reply_fut).await?;
-        self.inner.borrow_mut().mailboxes.remove(&sid);
-
         let msg = result?;
         if let Some(ref hdrs) = msg.headers {
             if hdrs.status == Some(503) {
@@ -542,7 +578,7 @@ impl Client {
         Ok(msg)
     }
 
-    /// Request with headers.
+    /// Request with headers using the shared multiplexed inbox.
     pub async fn request_with_headers(
         &self,
         subject: &str,
@@ -551,39 +587,32 @@ impl Client {
         timeout: Duration,
     ) -> Result<Message, Error> {
         self.check_closed()?;
-        let inbox = self.new_inbox();
-        let sid = self.next_sid();
+        self.check_payload_size(payload.len())?;
 
-        let mut batch = Vec::new();
-        batch.extend_from_slice(&proto::encode_sub(&inbox, &sid)?);
-        batch.extend_from_slice(&proto::encode_unsub(&sid, Some(1)));
-        batch.extend_from_slice(&proto::encode_hpub(
-            subject,
-            Some(&inbox),
-            headers,
-            payload,
-        )?);
-
-        {
+        let (token, reply_to) = {
             let mut inner = self.inner.borrow_mut();
-            inner.mailboxes.insert(
-                sid.clone(),
-                Mailbox {
-                    queue: VecDeque::new(),
+            let r = xorshift64(&mut inner.rng);
+            let token = format!("{r:016x}");
+            let reply_to = format!("{}{token}", inner.inbox_prefix);
+            inner.pending_requests.insert(
+                token.clone(),
+                RequestSlot {
+                    response: None,
                     waker: None,
                 },
             );
-        }
-        self.enqueue_write(&batch)?;
+            (token, reply_to)
+        };
+
+        let data = proto::encode_hpub(subject, Some(&reply_to), headers, payload)?;
+        self.enqueue_write(&data)?;
 
         let reply_fut = RequestFuture {
-            sid: sid.clone(),
+            token: token.clone(),
             inner: Rc::clone(&self.inner),
         };
 
         let result = with_timeout(timeout, reply_fut).await?;
-        self.inner.borrow_mut().mailboxes.remove(&sid);
-
         let msg = result?;
         if let Some(ref hdrs) = msg.headers {
             if hdrs.status == Some(503) {
@@ -609,6 +638,7 @@ impl Client {
     pub fn close(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.closed = true;
+        inner._socket = None;
         wake_all(&mut inner);
     }
 
@@ -617,15 +647,16 @@ impl Client {
     /// Returns `Err(Error::Timeout)` if the server doesn't respond within `timeout`.
     pub async fn flush(&self, timeout: Duration) -> Result<(), Error> {
         self.check_closed()?;
-        // Enqueue a PING — server will echo back PONG once it processes everything.
-        {
+        let target_pongs = {
             let mut inner = self.inner.borrow_mut();
+            let target = inner.pongs_received + 1;
             inner.write_buf.extend_from_slice(proto::PING);
             if let Some(w) = inner.flush_waker.take() {
                 w.wake();
             }
-        }
-        with_timeout(timeout, PongWait { inner: &self.inner, registered: false }).await?
+            target
+        };
+        with_timeout(timeout, PongWait { inner: &self.inner, target_pongs }).await?
     }
 
     fn next_sid(&self) -> String {
@@ -821,13 +852,19 @@ async fn stream_read(rx: &mut StreamReader<u8>, buf: &mut Vec<u8>, scratch: Vec<
     }
 }
 
-/// Write all bytes to a P3 `StreamWriter<u8>`.
-async fn stream_write_all(tx: &mut StreamWriter<u8>, data: &[u8]) -> Result<(), Error> {
-    let remaining = tx.write_all(data.to_vec()).await;
+/// Write owned bytes to a P3 `StreamWriter<u8>` without extra allocation.
+/// Returns unwritten bytes on failure so they can be requeued without loss.
+async fn stream_write_vec(tx: &mut StreamWriter<u8>, data: Vec<u8>) -> Result<(), (Vec<u8>, Error)> {
+    let remaining = tx.write_all(data).await;
     if !remaining.is_empty() {
-        return Err(Error::Disconnected);
+        return Err((remaining, Error::Disconnected));
     }
     Ok(())
+}
+
+/// Write all bytes from a slice to a P3 `StreamWriter<u8>`.
+async fn stream_write_all(tx: &mut StreamWriter<u8>, data: &[u8]) -> Result<(), Error> {
+    stream_write_vec(tx, data.to_vec()).await.map_err(|(_, e)| e)
 }
 
 // ── Futures: subscription / request ────────────────────────────────
@@ -861,7 +898,7 @@ impl<'a> Future for NextMessage<'a> {
 }
 
 struct RequestFuture {
-    sid: String,
+    token: String,
     inner: Rc<RefCell<Inner>>,
 }
 
@@ -876,26 +913,34 @@ impl Future for RequestFuture {
                 None => Error::Disconnected,
             }));
         }
-        if let Some(mailbox) = inner.mailboxes.get_mut(&self.sid) {
-            if let Some(msg) = mailbox.queue.pop_front() {
+        if let Some(slot) = inner.pending_requests.get_mut(&self.token) {
+            if let Some(msg) = slot.response.take() {
                 return Poll::Ready(Ok(msg));
             }
-            mailbox.waker = Some(cx.waker().clone());
+            slot.waker = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(Error::Disconnected))
         }
-        Poll::Pending
+    }
+}
+
+impl Drop for RequestFuture {
+    fn drop(&mut self) {
+        // Automatically reclaim slot on normal completion, timeout, or cancellation.
+        self.inner.borrow_mut().pending_requests.remove(&self.token);
     }
 }
 
 struct PongWait<'a> {
     inner: &'a Rc<RefCell<Inner>>,
-    /// Tracks whether we've installed the waker in `inner.pong_waker` yet.
-    registered: bool,
+    target_pongs: u64,
 }
 
 impl<'a> Future for PongWait<'a> {
     type Output = Result<(), Error>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.inner.borrow_mut();
         if inner.closed {
             return Poll::Ready(Err(match &inner.close_error {
@@ -903,20 +948,12 @@ impl<'a> Future for PongWait<'a> {
                 None => Error::Disconnected,
             }));
         }
-        if self.registered {
-            // We've already installed the waker. If dispatch_op fired it,
-            // pong_waker is now None — that means the PONG has arrived.
-            if inner.pong_waker.is_none() {
-                return Poll::Ready(Ok(()));
-            }
-            // Spurious wakeup — update the waker in case it changed.
-            inner.pong_waker = Some(cx.waker().clone());
+        if inner.pongs_received >= self.target_pongs {
+            Poll::Ready(Ok(()))
         } else {
-            // First poll: install our waker and wait.
-            inner.pong_waker = Some(cx.waker().clone());
-            self.registered = true;
+            inner.pong_wakers.push(cx.waker().clone());
+            Poll::Pending
         }
-        Poll::Pending
     }
 }
 
@@ -1054,12 +1091,9 @@ async fn attempt_reconnect(
             continue;
         }
 
-        let (mut rx, _rx_fut) = socket.receive();
+        let (mut rx, rx_fut) = socket.receive();
         let (tx, tx_rx) = wit_stream::new();
-        let _send_fut = socket.send(tx_rx);
-        std::mem::forget(socket);
-        std::mem::forget(_rx_fut);
-        std::mem::forget(_send_fut);
+        let send_fut = socket.send(tx_rx);
 
         // Read INFO.
         let mut buf = Vec::new();
@@ -1198,14 +1232,23 @@ async fn attempt_reconnect(
             continue;
         }
 
-        // Hand new writer to flush loop.
+        // Hand new socket & writer to inner / flush loop.
         {
             let mut inner_ref = inner.borrow_mut();
+            inner_ref._socket = Some(socket);
             inner_ref.new_writer = Some(tx);
             if let Some(w) = inner_ref.flush_waker.take() {
                 w.wake();
             }
         }
+
+        // Drain background futures so they don't leak.
+        wit_bindgen::spawn(async move {
+            let _ = rx_fut.await;
+        });
+        wit_bindgen::spawn(async move {
+            let _ = send_fut.await;
+        });
 
         return Some(rx);
     }
@@ -1242,7 +1285,7 @@ fn xorshift64(state: &mut u64) -> u64 {
 fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
     match op {
         ServerOp::Msg(msg) => {
-            deliver(
+            dispatch_msg(
                 inner,
                 &msg.sid,
                 Message {
@@ -1254,7 +1297,7 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
             );
         }
         ServerOp::HMsg(hmsg) => {
-            deliver(
+            dispatch_msg(
                 inner,
                 &hmsg.sid,
                 Message {
@@ -1273,8 +1316,9 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
             }
         }
         ServerOp::Pong => {
-            // Wake any pending flush() call waiting for the PONG.
-            if let Some(w) = inner.borrow_mut().pong_waker.take() {
+            let mut inner = inner.borrow_mut();
+            inner.pongs_received += 1;
+            for w in std::mem::take(&mut inner.pong_wakers) {
                 w.wake();
             }
         }
@@ -1294,8 +1338,21 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
     }
 }
 
-fn deliver(inner: &Rc<RefCell<Inner>>, sid: &str, message: Message) {
+fn dispatch_msg(inner: &Rc<RefCell<Inner>>, sid: &str, message: Message) {
     let mut inner = inner.borrow_mut();
+
+    // Check if message is a reply to a multiplexed request.
+    if message.subject.starts_with(&inner.inbox_prefix) {
+        let token = &message.subject[inner.inbox_prefix.len()..];
+        if let Some(slot) = inner.pending_requests.get_mut(token) {
+            slot.response = Some(message);
+            if let Some(w) = slot.waker.take() {
+                w.wake();
+            }
+            return;
+        }
+    }
+
     let capacity = inner.mailbox_capacity;
     if let Some(mailbox) = inner.mailboxes.get_mut(sid) {
         // Slow-consumer protection: drop the oldest message when at capacity.
@@ -1315,10 +1372,15 @@ fn wake_all(inner: &mut Inner) {
             w.wake();
         }
     }
+    for slot in inner.pending_requests.values_mut() {
+        if let Some(w) = slot.waker.take() {
+            w.wake();
+        }
+    }
     if let Some(w) = inner.flush_waker.take() {
         w.wake();
     }
-    if let Some(w) = inner.pong_waker.take() {
+    for w in std::mem::take(&mut inner.pong_wakers) {
         w.wake();
     }
 }
@@ -1347,11 +1409,11 @@ async fn flush_loop(inner: Rc<RefCell<Inner>>, mut writer: StreamWriter<u8>) {
             std::mem::take(&mut inner.write_buf)
         };
 
-        if stream_write_all(&mut writer, &data).await.is_err() {
-            // Re-queue the data so it will be retried once the reconnect
+        if let Err((unwritten, _)) = stream_write_vec(&mut writer, data).await {
+            // Re-queue the unwritten data so it will be retried once the reconnect
             // logic delivers a new writer via `inner.new_writer`.
             let mut inner_ref = inner.borrow_mut();
-            let mut requeued = data;
+            let mut requeued = unwritten;
             requeued.extend_from_slice(&inner_ref.write_buf);
             inner_ref.write_buf = requeued;
             continue;
@@ -1379,37 +1441,129 @@ impl<'a> Future for FlushWait<'a> {
 
 #[cfg(test)]
 mod tests {
-use super::xorshift64;
+    use super::*;
 
-#[test]
-fn xorshift64_never_repeats_in_short_run() {
-    let mut state = 0xcafe_babe_dead_beef_u64;
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..1_000 {
-        let v = xorshift64(&mut state);
-        assert!(seen.insert(v), "xorshift64 produced a duplicate in the first 1000 outputs");
+    #[test]
+    fn xorshift64_never_repeats_in_short_run() {
+        let mut state = 0xcafe_babe_dead_beef_u64;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            let v = xorshift64(&mut state);
+            assert!(seen.insert(v), "xorshift64 produced a duplicate in the first 1000 outputs");
+        }
     }
-}
 
-#[test]
-fn xorshift64_nonzero_seed_stays_nonzero() {
-    let mut state = 1u64;
-    for _ in 0..100 {
-        let v = xorshift64(&mut state);
-        assert_ne!(v, 0, "xorshift64 must never output 0 given a valid seed");
+    #[test]
+    fn xorshift64_nonzero_seed_stays_nonzero() {
+        let mut state = 1u64;
+        for _ in 0..100 {
+            let v = xorshift64(&mut state);
+            assert_ne!(v, 0, "xorshift64 must never output 0 given a valid seed");
+        }
     }
-}
 
-#[test]
-fn inbox_format_is_32_hex_chars() {
-    // Verify the _INBOX. prefix + exactly 32 hex characters (two u64s).
-    let mut rng = 0x1234_5678_9abc_def0_u64;
-    let r1 = xorshift64(&mut rng);
-    let r2 = xorshift64(&mut rng);
-    let inbox = format!("_INBOX.{r1:016x}{r2:016x}");
-    assert!(inbox.starts_with("_INBOX."), "wrong prefix");
-    let token = &inbox["_INBOX.".len()..];
-    assert_eq!(token.len(), 32, "token should be 32 hex chars");
-    assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in token");
-}
+    #[test]
+    fn inbox_format_is_32_hex_chars() {
+        // Verify the _INBOX. prefix + exactly 32 hex characters (two u64s).
+        let mut rng = 0x1234_5678_9abc_def0_u64;
+        let r1 = xorshift64(&mut rng);
+        let r2 = xorshift64(&mut rng);
+        let inbox = format!("_INBOX.{r1:016x}{r2:016x}");
+        assert!(inbox.starts_with("_INBOX."), "wrong prefix");
+        let token = &inbox["_INBOX.".len()..];
+        assert_eq!(token.len(), 32, "token should be 32 hex chars");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in token");
+    }
+
+    #[test]
+    fn mux_inbox_dispatch_and_raii_cleanup() {
+        let inner = Rc::new(RefCell::new(Inner {
+            _socket: None,
+            mailboxes: HashMap::new(),
+            subscriptions: HashMap::new(),
+            pending_requests: HashMap::new(),
+            inbox_prefix: "_INBOX.testclient1234.".to_string(),
+            write_buf: Vec::new(),
+            flush_waker: None,
+            pong_wakers: Vec::new(),
+            pongs_received: 0,
+            next_id: 1,
+            rng: 12345,
+            closed: false,
+            close_error: None,
+            new_writer: None,
+            known_servers: Vec::new(),
+            mailbox_capacity: 64,
+            write_buf_limit: 1024,
+            max_payload: 1024,
+        }));
+
+        let token = "deadbeef01020304".to_string();
+        inner.borrow_mut().pending_requests.insert(
+            token.clone(),
+            RequestSlot {
+                response: None,
+                waker: None,
+            },
+        );
+
+        // Verify message for this token is routed to pending_requests
+        let reply_subject = format!("_INBOX.testclient1234.{token}");
+        dispatch_msg(
+            &inner,
+            "0",
+            Message {
+                subject: reply_subject.clone(),
+                reply_to: None,
+                headers: None,
+                payload: b"pong-response".to_vec(),
+            },
+        );
+
+        {
+            let mut inner_mut = inner.borrow_mut();
+            let slot = inner_mut.pending_requests.get_mut(&token).expect("slot exists");
+            let resp = slot.response.take().expect("got response");
+            assert_eq!(resp.payload, b"pong-response");
+        }
+
+        // Test RAII Drop cleanup
+        let req_fut = RequestFuture {
+            token: token.clone(),
+            inner: Rc::clone(&inner),
+        };
+        assert!(inner.borrow().pending_requests.contains_key(&token));
+        drop(req_fut);
+        assert!(!inner.borrow().pending_requests.contains_key(&token), "drop must remove pending request slot");
+    }
+
+    #[test]
+    fn pong_tracking_wakes_all_waiters() {
+        let inner = Rc::new(RefCell::new(Inner {
+            _socket: None,
+            mailboxes: HashMap::new(),
+            subscriptions: HashMap::new(),
+            pending_requests: HashMap::new(),
+            inbox_prefix: "_INBOX.testclient.".to_string(),
+            write_buf: Vec::new(),
+            flush_waker: None,
+            pong_wakers: Vec::new(),
+            pongs_received: 0,
+            next_id: 1,
+            rng: 12345,
+            closed: false,
+            close_error: None,
+            new_writer: None,
+            known_servers: Vec::new(),
+            mailbox_capacity: 64,
+            write_buf_limit: 1024,
+            max_payload: 1024,
+        }));
+
+        assert_eq!(inner.borrow().pongs_received, 0);
+        dispatch_op(&inner, ServerOp::Pong);
+        assert_eq!(inner.borrow().pongs_received, 1);
+        dispatch_op(&inner, ServerOp::Pong);
+        assert_eq!(inner.borrow().pongs_received, 2);
+    }
 }
