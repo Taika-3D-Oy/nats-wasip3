@@ -94,6 +94,17 @@ pub struct ObjectInfo {
     /// NATS object store specification. `None` for objects created without
     /// digest support (e.g. tombstones).
     pub digest: Option<String>,
+    /// Link target if this object is a link.
+    pub link: Option<ObjectLink>,
+}
+
+/// Link target for symbolic object links.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLink {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl ObjectStore {
@@ -191,6 +202,7 @@ impl ObjectStore {
             digest: Some(digest),
             options: Some(ObjectMetaOptions {
                 max_chunk_size: Some(chunk_size),
+                link: None,
             }),
         };
         self.publish_meta(&meta).await?;
@@ -328,15 +340,109 @@ impl ObjectStore {
         Ok(true)
     }
 
+    /// Seal the Object Store bucket, permanently making it read-only.
+    pub async fn seal(&self) -> Result<(), Error> {
+        let info = self.js.stream_info(&self.stream_name).await?;
+        let mut cfg = info.config;
+        cfg.sealed = true;
+        self.js.update_stream(&cfg).await?;
+        Ok(())
+    }
+
+    /// Watch for object changes (creations, updates, deletions) in this bucket.
+    pub async fn watch(&self) -> Result<ObjectWatcher, Error> {
+        let subject = format!("{OBJ_SUBJECT_PREFIX}.{}.M.>", self.bucket);
+        let deliver = self.js.client().new_inbox();
+        let sub = self.js.client().subscribe(&deliver)?;
+
+        let consumer_cfg = ConsumerConfig {
+            deliver_subject: Some(deliver),
+            filter_subject: Some(subject),
+            deliver_policy: DeliverPolicy::LastPerSubject,
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            ..Default::default()
+        };
+
+        let info = self.js.create_consumer(&self.stream_name, &consumer_cfg).await?;
+
+        Ok(ObjectWatcher {
+            sub,
+            js: self.js.clone(),
+            stream_name: self.stream_name.clone(),
+            consumer_name: info.name,
+        })
+    }
+
+    /// Create a symbolic link to another object in the same bucket.
+    pub async fn link(&self, name: &str, target_name: &str) -> Result<ObjectInfo, Error> {
+        if name.is_empty() || target_name.is_empty() {
+            return Err(Error::Protocol("link name and target must not be empty".into()));
+        }
+
+        let nuid = generate_chunk_subject_id()?;
+        let meta = ObjectMeta {
+            name: name.to_string(),
+            bucket: self.bucket.clone(),
+            nuid,
+            size: 0,
+            chunks: 0,
+            mtime: now_rfc3339(),
+            deleted: false,
+            digest: None,
+            options: Some(ObjectMetaOptions {
+                max_chunk_size: None,
+                link: Some(ObjectLink {
+                    bucket: None,
+                    name: Some(target_name.to_string()),
+                }),
+            }),
+        };
+        self.publish_meta(&meta).await?;
+        Ok(meta_to_info(meta))
+    }
+
+    /// Create a symbolic link to another bucket.
+    pub async fn link_bucket(&self, name: &str, target_bucket: &str) -> Result<ObjectInfo, Error> {
+        if name.is_empty() || target_bucket.is_empty() {
+            return Err(Error::Protocol("link name and target bucket must not be empty".into()));
+        }
+
+        let nuid = generate_chunk_subject_id()?;
+        let meta = ObjectMeta {
+            name: name.to_string(),
+            bucket: self.bucket.clone(),
+            nuid,
+            size: 0,
+            chunks: 0,
+            mtime: now_rfc3339(),
+            deleted: false,
+            digest: None,
+            options: Some(ObjectMetaOptions {
+                max_chunk_size: None,
+                link: Some(ObjectLink {
+                    bucket: Some(target_bucket.to_string()),
+                    name: None,
+                }),
+            }),
+        };
+        self.publish_meta(&meta).await?;
+        Ok(meta_to_info(meta))
+    }
+
     /// Return runtime status / statistics for this bucket.
     pub async fn status(&self) -> Result<ObjectStoreStatus, Error> {
         let info = self.js.stream_info(&self.stream_name).await?;
         let objects = self.list().await?.len() as u64;
+        let ttl = match info.config.max_age {
+            Some(0) => None,
+            other => other,
+        };
         Ok(ObjectStoreStatus {
             bucket: self.bucket.clone(),
             objects,
             bytes: info.state.bytes,
-            ttl: info.config.max_age,
+            ttl,
             stream_name: self.stream_name.clone(),
         })
     }
@@ -401,6 +507,32 @@ impl ObjectStore {
     }
 }
 
+/// Stream watcher for object changes in an Object Store bucket.
+pub struct ObjectWatcher {
+    sub: crate::client::Subscription,
+    js: JetStream,
+    stream_name: String,
+    consumer_name: String,
+}
+
+impl ObjectWatcher {
+    /// Receive the next object change notification.
+    pub async fn next(&self) -> Result<ObjectInfo, Error> {
+        let msg = self.sub.next().await?;
+        let meta: ObjectMeta = serde_json::from_slice(&msg.payload)?;
+        Ok(meta_to_info(meta))
+    }
+}
+
+impl Drop for ObjectWatcher {
+    fn drop(&mut self) {
+        let _ = self.sub.unsubscribe();
+        let inbox = self.js.client().new_inbox();
+        let del = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream_name, self.consumer_name);
+        let _ = self.js.client().publish_with_reply(&del, &inbox, b"");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ObjectMeta {
     name: String,
@@ -418,10 +550,12 @@ struct ObjectMeta {
     options: Option<ObjectMetaOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ObjectMetaOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_chunk_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<ObjectLink>,
 }
 
 fn meta_to_info(meta: ObjectMeta) -> ObjectInfo {
@@ -434,7 +568,8 @@ fn meta_to_info(meta: ObjectMeta) -> ObjectInfo {
         mtime: meta.mtime,
         deleted: meta.deleted,
         digest: meta.digest,
-        max_chunk_size: meta.options.and_then(|o| o.max_chunk_size),
+        max_chunk_size: meta.options.as_ref().and_then(|o| o.max_chunk_size),
+        link: meta.options.and_then(|o| o.link),
     }
 }
 
@@ -467,9 +602,19 @@ fn format_rfc3339(secs: u64, nanos: u32) -> String {
 }
 
 fn now_unix_nanos() -> u128 {
-    let dt = wasip3::clocks::system_clock::now();
-    let secs = dt.seconds.max(0) as u128;
-    secs * 1_000_000_000 + dt.nanoseconds as u128
+    #[cfg(target_arch = "wasm32")]
+    {
+        let dt = wasip3::clocks::system_clock::now();
+        let secs = dt.seconds.max(0) as u128;
+        secs * 1_000_000_000 + dt.nanoseconds as u128
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
 }
 
 #[cfg(test)]

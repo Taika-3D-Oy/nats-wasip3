@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::client::{secs, Client, Duration, Message};
+use crate::client::{secs, Client, Duration, Message, Subscription};
 use crate::proto::Headers;
 use crate::Error;
 
@@ -96,9 +96,15 @@ impl JetStream {
 
     // ── Stream management ──────────────────────────────────────
 
-    /// Create or update a stream.
+    /// Create a stream.
     pub async fn create_stream(&self, config: &StreamConfig) -> Result<StreamInfo, Error> {
         self.api_request(&format!("STREAM.CREATE.{}", config.name), config)
+            .await
+    }
+
+    /// Update an existing stream configuration.
+    pub async fn update_stream(&self, config: &StreamConfig) -> Result<StreamInfo, Error> {
+        self.api_request(&format!("STREAM.UPDATE.{}", config.name), config)
             .await
     }
 
@@ -335,6 +341,114 @@ impl JetStream {
         }))
     }
 
+    /// Get the last message for a subject directly using `$JS.API.DIRECT.GET.LAST.<stream>.<subject>`.
+    /// Requires `allow_direct: true` on the stream.
+    ///
+    /// This bypasses JSON wrapping and returns the raw message payload directly with headers.
+    pub async fn direct_get_last_for_subject(
+        &self,
+        stream: &str,
+        subject: &str,
+    ) -> Result<Option<DirectMessage>, Error> {
+        let direct_subject = format!("{}.DIRECT.GET.{stream}.{subject}", self.prefix);
+        let reply = match self
+            .client
+            .request(&direct_subject, b"", js_api_timeout())
+            .await
+        {
+            Ok(msg) => msg,
+            Err(Error::Timeout) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if let Some(ref h) = reply.headers {
+            if let Some(status) = h.status {
+                if status == 404 || status == 408 {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let headers = reply.headers.clone().unwrap_or_default();
+        let seq = headers
+            .get("Nats-Sequence")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let timestamp = headers.get("Nats-Time-Stamp").map(|s| s.to_string());
+        let orig_subject = headers
+            .get("Nats-Subject")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| subject.to_string());
+
+        Ok(Some(DirectMessage {
+            subject: orig_subject,
+            sequence: seq,
+            timestamp,
+            headers: reply.headers,
+            payload: reply.payload,
+        }))
+    }
+
+    /// Get a message by stream sequence number directly using `$JS.API.DIRECT.GET.<stream>`.
+    /// Requires `allow_direct: true` on the stream.
+    pub async fn direct_get(
+        &self,
+        stream: &str,
+        seq: u64,
+    ) -> Result<Option<DirectMessage>, Error> {
+        #[derive(Serialize)]
+        struct DirectReq {
+            seq: u64,
+        }
+        let direct_subject = format!("{}.DIRECT.GET.{stream}", self.prefix);
+        let payload = serde_json::to_vec(&DirectReq { seq })?;
+        let reply = match self
+            .client
+            .request(&direct_subject, &payload, js_api_timeout())
+            .await
+        {
+            Ok(msg) => msg,
+            Err(Error::Timeout) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if let Some(ref h) = reply.headers {
+            if let Some(status) = h.status {
+                if status == 404 || status == 408 {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let headers = reply.headers.clone().unwrap_or_default();
+        let seq_num = headers
+            .get("Nats-Sequence")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(seq);
+        let timestamp = headers.get("Nats-Time-Stamp").map(|s| s.to_string());
+        let subject = headers
+            .get("Nats-Subject")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        Ok(Some(DirectMessage {
+            subject,
+            sequence: seq_num,
+            timestamp,
+            headers: reply.headers,
+            payload: reply.payload,
+        }))
+    }
+
+    /// Create an [`OrderedConsumer`] for sequenced, gap-detected, and auto-recovering stream consumption.
+    pub async fn ordered_consumer(
+        &self,
+        stream: &str,
+        config: OrderedConsumerConfig,
+    ) -> Result<OrderedConsumer, Error> {
+        OrderedConsumer::new(self.clone(), stream, config).await
+    }
+
     /// Access the underlying client (for direct publish, subscribe, etc.).
     pub fn client(&self) -> &Client {
         &self.client
@@ -499,6 +613,17 @@ impl JsMessage {
         Ok(())
     }
 
+    /// Negative-acknowledge with a backoff delay before redelivery.
+    /// Tells the NATS server to delay redelivery of this message by the specified duration.
+    pub fn nak_with_delay(&self, delay: Duration) -> Result<(), Error> {
+        if let Some(ref reply) = self.reply_to {
+            let nanos = delay;
+            let payload = format!("-NAK {{\"delay\": {nanos}}}");
+            self.client.publish(reply, payload.as_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Signal that processing is still in progress (extend ack deadline).
     pub fn in_progress(&self) -> Result<(), Error> {
         if let Some(ref reply) = self.reply_to {
@@ -513,6 +638,21 @@ impl JsMessage {
             self.client.publish(reply, b"+TERM")?;
         }
         Ok(())
+    }
+
+    /// Terminate further redelivery of this message with a reason string.
+    pub fn term_with_reason(&self, reason: &str) -> Result<(), Error> {
+        if let Some(ref reply) = self.reply_to {
+            let payload = format!("+TERM {reason}");
+            self.client.publish(reply, payload.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Parse and extract full JetStream ACK metadata from the delivery reply subject.
+    /// Supports both v1 (9-token) and v2 (12-token) NATS JetStream reply formats.
+    pub fn metadata(&self) -> Option<MsgMetadata> {
+        self.reply_to.as_deref().and_then(MsgMetadata::parse)
     }
 
     /// Server-side publish timestamp as an RFC 3339 string
@@ -532,18 +672,7 @@ impl JsMessage {
     /// Returns `None` if the reply-to subject is absent or has an unexpected
     /// format (e.g. a plain pub/sub message not delivered via JetStream).
     pub fn timestamp_nanos(&self) -> Option<u64> {
-        let reply = self.reply_to.as_deref()?;
-        let tokens: Vec<&str> = reply.split('.').collect();
-        // v1: $JS.ACK.<stream>.<consumer>.<del>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>
-        //     9 tokens — timestamp at index 7
-        // v2: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<del>.<ss>.<cs>.<ts_nanos>.<pending>.<token>
-        //     12 tokens — timestamp at index 9
-        let idx = match tokens.len() {
-            9 => 7,
-            12 => 9,
-            _ => return None,
-        };
-        tokens.get(idx)?.parse().ok()
+        self.metadata().map(|m| m.timestamp_nanos)
     }
 }
 
@@ -609,6 +738,9 @@ pub struct StreamConfig {
     /// Cluster placement directives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<Placement>,
+    /// Permanently seal the stream, preventing any further write or delete operations.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sealed: bool,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
@@ -688,7 +820,7 @@ pub struct Placement {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Retention {
     #[default]
@@ -698,7 +830,7 @@ pub enum Retention {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Storage {
     #[default]
@@ -707,7 +839,7 @@ pub enum Storage {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiscardPolicy {
     #[default]
@@ -769,6 +901,8 @@ pub struct ConsumerConfig {
     pub deliver_policy: DeliverPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opt_start_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_start_time: Option<String>,
     #[serde(default)]
     pub ack_policy: AckPolicy,
     #[serde(default)]
@@ -794,7 +928,7 @@ pub struct ConsumerConfig {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeliverPolicy {
     #[default]
@@ -803,12 +937,14 @@ pub enum DeliverPolicy {
     New,
     #[serde(rename = "by_start_sequence")]
     ByStartSequence,
+    #[serde(rename = "by_start_time")]
+    ByStartTime,
     #[serde(rename = "last_per_subject")]
     LastPerSubject,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplayPolicy {
     #[default]
@@ -817,7 +953,7 @@ pub enum ReplayPolicy {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AckPolicy {
     None,
@@ -858,3 +994,264 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, Error> {
         .decode(input)
         .map_err(|e| Error::Protocol(format!("base64: {e}")))
 }
+
+// ── Direct message (from DIRECT.GET) ───────────────────────────────
+
+/// A message retrieved directly from a stream via Direct Get.
+#[derive(Debug, Clone)]
+pub struct DirectMessage {
+    pub subject: String,
+    pub sequence: u64,
+    pub timestamp: Option<String>,
+    pub headers: Option<Headers>,
+    pub payload: Vec<u8>,
+}
+
+// ── ACK metadata ───────────────────────────────────────────────────
+
+/// Parsed ACK metadata extracted from JetStream delivery reply-to subjects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MsgMetadata {
+    pub stream: String,
+    pub consumer: String,
+    pub stream_sequence: u64,
+    pub consumer_sequence: u64,
+    pub num_delivered: u64,
+    pub num_pending: u64,
+    pub timestamp_nanos: u64,
+    pub domain: Option<String>,
+    pub account: Option<String>,
+}
+
+impl MsgMetadata {
+    /// Parse ACK metadata from a NATS reply-to subject string.
+    pub fn parse(reply: &str) -> Option<Self> {
+        let tokens: Vec<&str> = reply.split('.').collect();
+        match tokens.len() {
+            // v1: $JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>
+            9 => {
+                if tokens[0] != "$JS" || tokens[1] != "ACK" {
+                    return None;
+                }
+                Some(MsgMetadata {
+                    stream: tokens[2].to_string(),
+                    consumer: tokens[3].to_string(),
+                    num_delivered: tokens[4].parse().ok()?,
+                    stream_sequence: tokens[5].parse().ok()?,
+                    consumer_sequence: tokens[6].parse().ok()?,
+                    timestamp_nanos: tokens[7].parse().ok()?,
+                    num_pending: tokens[8].parse().ok()?,
+                    domain: None,
+                    account: None,
+                })
+            }
+            // v2: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>.<token>
+            12 => {
+                if tokens[0] != "$JS" || tokens[1] != "ACK" {
+                    return None;
+                }
+                Some(MsgMetadata {
+                    domain: if tokens[2].is_empty() { None } else { Some(tokens[2].to_string()) },
+                    account: if tokens[3].is_empty() { None } else { Some(tokens[3].to_string()) },
+                    stream: tokens[4].to_string(),
+                    consumer: tokens[5].to_string(),
+                    num_delivered: tokens[6].parse().ok()?,
+                    stream_sequence: tokens[7].parse().ok()?,
+                    consumer_sequence: tokens[8].parse().ok()?,
+                    timestamp_nanos: tokens[9].parse().ok()?,
+                    num_pending: tokens[10].parse().ok()?,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+// ── Ordered consumer ───────────────────────────────────────────────
+
+/// Configuration for an [`OrderedConsumer`].
+#[derive(Debug, Clone, Default)]
+pub struct OrderedConsumerConfig {
+    pub filter_subject: Option<String>,
+    pub opt_start_seq: Option<u64>,
+    pub opt_start_time: Option<String>,
+    pub deliver_policy: DeliverPolicy,
+    pub replay_policy: ReplayPolicy,
+}
+
+/// An ordered push consumer that provides ordered delivery and transparently
+/// recovers from sequence gaps by recreating an ephemeral consumer from the
+/// last received sequence.
+pub struct OrderedConsumer {
+    js: JetStream,
+    stream: String,
+    config: OrderedConsumerConfig,
+    deliver_subject: String,
+    sub: Subscription,
+    consumer_name: String,
+    last_stream_seq: u64,
+    last_consumer_seq: u64,
+}
+
+impl OrderedConsumer {
+    /// Create a new ordered consumer.
+    pub async fn new(
+        js: JetStream,
+        stream: impl Into<String>,
+        config: OrderedConsumerConfig,
+    ) -> Result<Self, Error> {
+        let stream = stream.into();
+        let deliver_subject = js.client.new_inbox();
+        let sub = js.client.subscribe(&deliver_subject)?;
+
+        let consumer_cfg = ConsumerConfig {
+            deliver_subject: Some(deliver_subject.clone()),
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            flow_control: Some(true),
+            idle_heartbeat_nanos: Some(crate::client::secs(5)),
+            filter_subject: config.filter_subject.clone(),
+            opt_start_seq: config.opt_start_seq,
+            opt_start_time: config.opt_start_time.clone(),
+            deliver_policy: config.deliver_policy,
+            replay_policy: Some(config.replay_policy),
+            ..Default::default()
+        };
+
+        let info = js.create_consumer(&stream, &consumer_cfg).await?;
+
+        Ok(Self {
+            js,
+            stream,
+            config,
+            deliver_subject,
+            sub,
+            consumer_name: info.name,
+            last_stream_seq: 0,
+            last_consumer_seq: 0,
+        })
+    }
+
+    /// Read the next ordered message, transparently recreating the consumer if a gap is detected.
+    pub async fn next(&mut self) -> Result<Message, Error> {
+        loop {
+            let msg = match self.sub.next().await {
+                Ok(m) => m,
+                Err(_) => {
+                    self.reset_consumer().await?;
+                    continue;
+                }
+            };
+
+            // Handle idle heartbeats & flow control
+            if let Some(ref h) = msg.headers {
+                if h.status == Some(100) {
+                    if let Some(ref reply) = msg.reply_to {
+                        let _ = self.js.client.publish(reply, b"");
+                    }
+                    continue;
+                }
+            }
+
+            // Extract metadata from reply-to subject
+            if let Some(ref reply) = msg.reply_to {
+                if let Some(meta) = MsgMetadata::parse(reply) {
+                    if self.last_consumer_seq > 0 && meta.consumer_sequence != self.last_consumer_seq + 1 {
+                        // Gap detected in consumer sequence! Reset consumer.
+                        self.reset_consumer().await?;
+                        continue;
+                    }
+                    self.last_stream_seq = meta.stream_sequence;
+                    self.last_consumer_seq = meta.consumer_sequence;
+                }
+            }
+
+            return Ok(msg);
+        }
+    }
+
+    async fn reset_consumer(&mut self) -> Result<(), Error> {
+        let _ = self.sub.unsubscribe();
+        let delete_subject = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream, self.consumer_name);
+        let inbox = self.js.client.new_inbox();
+        let _ = self.js.client.publish_with_reply(&delete_subject, &inbox, b"");
+
+        self.deliver_subject = self.js.client.new_inbox();
+        self.sub = self.js.client.subscribe(&self.deliver_subject)?;
+        self.last_consumer_seq = 0;
+
+        let start_seq = if self.last_stream_seq > 0 {
+            Some(self.last_stream_seq + 1)
+        } else {
+            self.config.opt_start_seq
+        };
+
+        let consumer_cfg = ConsumerConfig {
+            deliver_subject: Some(self.deliver_subject.clone()),
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            flow_control: Some(true),
+            idle_heartbeat_nanos: Some(crate::client::secs(5)),
+            filter_subject: self.config.filter_subject.clone(),
+            opt_start_seq: start_seq,
+            deliver_policy: if start_seq.is_some() {
+                DeliverPolicy::ByStartSequence
+            } else {
+                self.config.deliver_policy
+            },
+            replay_policy: Some(self.config.replay_policy),
+            ..Default::default()
+        };
+
+        let info = self.js.create_consumer(&self.stream, &consumer_cfg).await?;
+        self.consumer_name = info.name;
+        Ok(())
+    }
+}
+
+impl Drop for OrderedConsumer {
+    fn drop(&mut self) {
+        let _ = self.sub.unsubscribe();
+        let subject = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream, self.consumer_name);
+        let inbox = self.js.client.new_inbox();
+        let _ = self.js.client.publish_with_reply(&subject, &inbox, b"");
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ack_metadata_parsing_v1() {
+        let reply = "$JS.ACK.mystream.myconsumer.1.100.200.1700000000000000000.5";
+        let meta = MsgMetadata::parse(reply).expect("parse metadata");
+        assert_eq!(meta.stream, "mystream");
+        assert_eq!(meta.consumer, "myconsumer");
+        assert_eq!(meta.num_delivered, 1);
+        assert_eq!(meta.stream_sequence, 100);
+        assert_eq!(meta.consumer_sequence, 200);
+        assert_eq!(meta.timestamp_nanos, 1700000000000000000);
+        assert_eq!(meta.num_pending, 5);
+        assert_eq!(meta.domain, None);
+        assert_eq!(meta.account, None);
+    }
+
+    #[test]
+    fn test_ack_metadata_parsing_v2() {
+        let reply = "$JS.ACK.hub.acc1.orders.cons1.2.42.84.1700000000000000123.10.tok123";
+        let meta = MsgMetadata::parse(reply).expect("parse metadata");
+        assert_eq!(meta.domain.as_deref(), Some("hub"));
+        assert_eq!(meta.account.as_deref(), Some("acc1"));
+        assert_eq!(meta.stream, "orders");
+        assert_eq!(meta.consumer, "cons1");
+        assert_eq!(meta.num_delivered, 2);
+        assert_eq!(meta.stream_sequence, 42);
+        assert_eq!(meta.consumer_sequence, 84);
+        assert_eq!(meta.timestamp_nanos, 1700000000000000123);
+        assert_eq!(meta.num_pending, 10);
+    }
+}
+

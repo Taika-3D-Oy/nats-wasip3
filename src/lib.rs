@@ -46,6 +46,9 @@ pub mod tls;
 #[cfg(feature = "nkey")]
 pub mod nkey;
 
+#[cfg(feature = "service")]
+pub mod service;
+
 mod error;
 pub use error::Error;
 
@@ -57,3 +60,19 @@ pub use client::{
     millis, secs, with_timeout,
 };
 pub use proto::{Headers, ServerInfo};
+
+#[cfg(feature = "service")]
+pub use service::{
+    EndpointConfig, EndpointInfo, EndpointSchema, EndpointStats, EndpointSubscription,
+    Group, InfoResponse, PingResponse, SchemaResponse, Service, ServiceConfig,
+    ServiceRequest, StatsResponse,
+};
+
+#[cfg(feature = "jetstream")]
+pub use jetstream::{DirectMessage, MsgMetadata, OrderedConsumer, OrderedConsumerConfig};
+
+#[cfg(feature = "jetstream")]
+pub use object_store::{
+    Object, ObjectInfo, ObjectLink, ObjectStore, ObjectStoreConfig, ObjectStoreStatus,
+    ObjectWatcher,
+};

@@ -587,6 +587,45 @@ impl KeyValue {
         Ok(keys)
     }
 
+    /// List all keys matching a specific wildcard pattern (e.g. `"users.*"` or `"orders.>"`) in the bucket.
+    pub async fn keys_matching(&self, pattern: &str) -> Result<Vec<String>, Error> {
+        let subject = format!("{KV_SUBJECT_PREFIX}.{}.{pattern}", self.bucket);
+        let consumer_cfg = ConsumerConfig {
+            durable_name: None,
+            filter_subject: Some(subject),
+            deliver_policy: DeliverPolicy::LastPerSubject,
+            ack_policy: AckPolicy::None,
+            max_deliver: 1,
+            ..Default::default()
+        };
+
+        let info = self
+            .js
+            .create_consumer(&self.stream_name, &consumer_cfg)
+            .await?;
+
+        let msgs = self.js.fetch(&self.stream_name, &info.name, 1000).await?;
+
+        let prefix = format!("{KV_SUBJECT_PREFIX}.{}.", self.bucket);
+        let mut keys = Vec::new();
+        for msg in msgs {
+            if let Some(key) = msg.subject.strip_prefix(&prefix) {
+                let is_deleted = msg
+                    .headers
+                    .as_ref()
+                    .and_then(|h| h.get("KV-Operation"))
+                    .is_some();
+                if !is_deleted {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+
+        let _ = self.js.delete_consumer(&self.stream_name, &info.name).await;
+
+        Ok(keys)
+    }
+
     /// Bulk-load all live entries from the bucket.
     /// Returns the latest value for each non-deleted key.
     pub async fn load_all(&self) -> Result<Vec<Entry>, Error> {
@@ -746,12 +785,16 @@ impl KeyValue {
     /// Return runtime status / statistics for this bucket.
     pub async fn status(&self) -> Result<KvStatus, Error> {
         let info = self.js.stream_info(&self.stream_name).await?;
+        let ttl = match info.config.max_age {
+            Some(0) => None,
+            other => other,
+        };
         Ok(KvStatus {
             bucket: self.bucket.clone(),
             values: info.state.messages,
             bytes: info.state.bytes,
             history: info.config.max_msgs_per_subject,
-            ttl: info.config.max_age,
+            ttl,
             allow_msg_ttl: info.config.allow_msg_ttl,
             last_seq: info.state.last_seq,
         })

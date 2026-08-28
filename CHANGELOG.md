@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] – 2026-08-28
+
+### Added
+
+- **Microservices Framework ([ADR-32])**:
+  - Full implementation of NATS Microservices architecture under `service` feature (enabled by default).
+  - Standardized control verbs: `$SRV.PING`, `$SRV.INFO`, `$SRV.STATS`, `$SRV.SCHEMA` with filtering by service name and ID.
+  - Hierarchical routing groups (`Group`) with automatic subject prefixing and queue group inheritance.
+  - Per-endpoint latency, error, and request counting with thread-safe atomic stats counters.
+  - Support for custom stats, schema URLs/JSON definitions, and typed response builders.
+  - Added `examples/microservice.rs` demonstrating microservice setup, endpoint handlers, and service discovery.
+- **JetStream Feature Parity**:
+  - `JetStream::direct_get_last_for_subject` and `JetStream::direct_get` for zero-overhead direct message lookups without creating consumers.
+  - `JetStream::update_stream` with stream config mutation support (e.g. sealing streams).
+  - `OrderedConsumer`: Ordered push consumer with automatic heartbeat tracking, flow control response, and transparent ephemeral consumer recreation upon sequence gap detection.
+  - `MsgMetadata`: Parser for delivery reply-to subjects supporting both v1 (9-token) and v2 (12-token) formats.
+  - `JsMessage::nak_with_delay(Duration)` for delayed redelivery backoff.
+  - `JsMessage::term_with_reason(&str)` for terminating message redelivery with explicit reason metadata.
+- **KV Store Enhancements**:
+  - `KvStore::keys_matching(&str)` for wildcard-filtered key discovery.
+- **Object Store Enhancements**:
+  - `ObjectStore::seal()` to permanently make an object store bucket read-only.
+  - `ObjectStore::watch()` returning `ObjectWatcher` for real-time object mutations.
+  - `ObjectStore::link()` and `ObjectStore::link_bucket()` supporting cross-bucket and multi-object links via `ObjectLink`.
+
 ## [0.11.5] – 2026-08-28
 
 ### Changed

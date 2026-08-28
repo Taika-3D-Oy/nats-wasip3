@@ -2143,6 +2143,177 @@ async fn test_connect_dns_hostname() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+//  New Feature Parity Integration Tests
+// ══════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "service")]
+async fn test_microservice_discovery() {
+    use nats_wasip3::{Service, ServiceConfig, EndpointConfig, PingResponse, InfoResponse, StatsResponse};
+
+    let client = connect().await;
+    let config = ServiceConfig::new("calc-svc", "1.2.3")
+        .description("Calculator Service");
+    let mut service = Service::add(client.clone(), config)
+        .await
+        .unwrap();
+
+    let sub = service.add_endpoint(
+        EndpointConfig::new("add")
+            .subject("calc.add")
+    ).await.unwrap();
+
+    // Handle requests in background
+    let _handler = wit_bindgen::spawn(async move {
+        while let Ok(req) = sub.next().await {
+            let num: i64 = serde_json::from_slice(&req.message.payload).unwrap_or(0);
+            let resp_bytes = serde_json::to_vec(&(num + 10)).unwrap();
+            let _ = req.respond(&resp_bytes);
+        }
+    });
+
+    // PING discovery
+    let ping_msg = client.request("$SRV.PING.calc-svc", b"", secs(2)).await.unwrap();
+    let ping: PingResponse = serde_json::from_slice(&ping_msg.payload).unwrap();
+    assert_eq!(ping.name, "calc-svc");
+    assert_eq!(ping.version, "1.2.3");
+
+    // INFO discovery
+    let info_msg = client.request("$SRV.INFO.calc-svc", b"", secs(2)).await.unwrap();
+    let info: InfoResponse = serde_json::from_slice(&info_msg.payload).unwrap();
+    assert_eq!(info.endpoints.len(), 1);
+    assert_eq!(info.endpoints[0].name, "add");
+    assert_eq!(info.endpoints[0].subject, "calc.add");
+
+    // Service request
+    let resp = client.request("calc.add", b"32", secs(2)).await.unwrap();
+    let result: i64 = serde_json::from_slice(&resp.payload).unwrap();
+    assert_eq!(result, 42);
+
+    // STATS discovery
+    let stats_msg = client.request("$SRV.STATS.calc-svc", b"", secs(2)).await.unwrap();
+    let stats: StatsResponse = serde_json::from_slice(&stats_msg.payload).unwrap();
+    assert_eq!(stats.endpoints.len(), 1);
+    assert_eq!(stats.endpoints[0].num_requests, 1);
+    assert_eq!(stats.endpoints[0].num_errors, 0);
+
+    service.stop();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_jetstream_direct_get() {
+    use nats_wasip3::jetstream::{JetStream, StreamConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("DIRECT_GET_TEST").await;
+    js.create_stream(&StreamConfig {
+        name: "DIRECT_GET_TEST".into(),
+        subjects: vec!["direct.>".into()],
+        allow_direct: true,
+        ..Default::default()
+    }).await.unwrap();
+
+    js.publish("direct.item.a", b"alpha").await.unwrap();
+    js.publish("direct.item.b", b"beta").await.unwrap();
+
+    // Direct get last for subject
+    let msg_a = js.direct_get_last_for_subject("DIRECT_GET_TEST", "direct.item.a").await.unwrap().expect("msg a exists");
+    assert_eq!(msg_a.subject, "direct.item.a");
+    assert_eq!(msg_a.payload, b"alpha");
+
+    // Direct get by sequence
+    let msg_1 = js.direct_get("DIRECT_GET_TEST", 1).await.unwrap().expect("msg 1 exists");
+    assert_eq!(msg_1.sequence, 1);
+    assert_eq!(msg_1.payload, b"alpha");
+
+    js.delete_stream("DIRECT_GET_TEST").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_jetstream_ordered_consumer() {
+    use nats_wasip3::jetstream::{JetStream, StreamConfig, OrderedConsumerConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("ORDERED_TEST").await;
+    js.create_stream(&StreamConfig {
+        name: "ORDERED_TEST".into(),
+        subjects: vec!["ordered.>".into()],
+        ..Default::default()
+    }).await.unwrap();
+
+    for i in 1..=5 {
+        js.publish("ordered.msg", format!("val-{i}").as_bytes()).await.unwrap();
+    }
+
+    let mut consumer = js.ordered_consumer("ORDERED_TEST", OrderedConsumerConfig {
+        filter_subject: Some("ordered.msg".into()),
+        ..Default::default()
+    }).await.unwrap();
+
+    for i in 1..=5 {
+        let msg = consumer.next().await.unwrap();
+        assert_eq!(msg.payload, format!("val-{i}").as_bytes());
+    }
+
+    js.delete_stream("ORDERED_TEST").await.unwrap();
+}
+
+#[cfg(feature = "kv")]
+async fn test_kv_keys_matching() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::kv::{KeyValue, KvConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("KV_match_test").await;
+    let kv = KeyValue::new(js.clone(), KvConfig {
+        bucket: "match_test".into(),
+        ..Default::default()
+    }).await.unwrap();
+
+    kv.put("cfg.app.host", b"localhost").await.unwrap();
+    kv.put("cfg.app.port", b"8080").await.unwrap();
+    kv.put("data.user.1", b"alice").await.unwrap();
+
+    let mut keys = kv.keys_matching("cfg.app.*").await.unwrap();
+    keys.sort();
+    assert_eq!(keys, vec!["cfg.app.host", "cfg.app.port"]);
+
+    js.delete_stream("KV_match_test").await.unwrap();
+}
+
+#[cfg(feature = "jetstream")]
+async fn test_object_store_seal_and_link() {
+    use nats_wasip3::jetstream::JetStream;
+    use nats_wasip3::object_store::{ObjectStore, ObjectStoreConfig};
+
+    let client = connect().await;
+    let js = JetStream::new(client);
+
+    let _ = js.delete_stream("OBJ_seal_test").await;
+    let store = ObjectStore::new(js.clone(), ObjectStoreConfig {
+        bucket: "seal_test".into(),
+        ..Default::default()
+    }).await.unwrap();
+
+    store.put("orig.txt", b"secret").await.unwrap();
+    store.link("symlink.txt", "orig.txt").await.unwrap();
+
+    let obj = store.get("symlink.txt").await.unwrap().expect("link exists");
+    assert!(obj.info.link.is_some());
+
+    store.seal().await.unwrap();
+    let status = store.status().await.unwrap();
+    assert_eq!(status.objects, 2);
+
+    js.delete_stream("OBJ_seal_test").await.unwrap();
+}
+
+// ══════════════════════════════════════════════════════════════════
 //  Test runner
 // ══════════════════════════════════════════════════════════════════
 
@@ -2209,6 +2380,8 @@ async fn run_tests() {
         run_test!("test_jetstream_stream_info_not_found", test_jetstream_stream_info_not_found().await);
         run_test!("test_jetstream_purge_subject", test_jetstream_purge_subject().await);
         run_test!("test_jetstream_max_msgs_per_subject", test_jetstream_max_msgs_per_subject().await);
+        run_test!("test_jetstream_direct_get", test_jetstream_direct_get().await);
+        run_test!("test_jetstream_ordered_consumer", test_jetstream_ordered_consumer().await);
     }
 
     // ── KV ─────────────────────────────────────────────────────
@@ -2234,6 +2407,7 @@ async fn run_tests() {
         run_test!("test_kv_watch_single_key", test_kv_watch_single_key().await);
         run_test!("test_kv_stream_name", test_kv_stream_name().await);
         run_test!("test_kv_put_with_ttl", test_kv_put_with_ttl().await);
+        run_test!("test_kv_keys_matching", test_kv_keys_matching().await);
     }
 
     // ── Object Store ───────────────────────────────────────────
@@ -2248,6 +2422,13 @@ async fn run_tests() {
         run_test!("test_object_store_status", test_object_store_status().await);
         run_test!("test_object_store_open_existing", test_object_store_open_existing().await);
         run_test!("test_object_store_digest_mismatch", test_object_store_digest_mismatch().await);
+        run_test!("test_object_store_seal_and_link", test_object_store_seal_and_link().await);
+    }
+
+    // ── Microservices (ADR-32) ─────────────────────────────────
+    #[cfg(feature = "service")]
+    {
+        run_test!("test_microservice_discovery", test_microservice_discovery().await);
     }
 
     // ── TLS ────────────────────────────────────────────────────

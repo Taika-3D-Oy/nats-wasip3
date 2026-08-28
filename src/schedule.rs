@@ -255,8 +255,18 @@ impl ScheduleSpec {
 /// Suitable for use with [`Schedule::At`] for an "immediately" one-shot or
 /// as a base to add a duration manually.
 pub fn now_rfc3339() -> String {
-    let dt = wasip3::clocks::system_clock::now();
-    format_rfc3339(dt.seconds.max(0) as u64, dt.nanoseconds)
+    #[cfg(target_arch = "wasm32")]
+    {
+        let dt = wasip3::clocks::system_clock::now();
+        format_rfc3339(dt.seconds.max(0) as u64, dt.nanoseconds)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format_rfc3339(d.as_secs(), d.subsec_nanos())
+    }
 }
 
 /// Returns the wall-clock time `delta_secs` seconds from now, formatted as
@@ -272,10 +282,20 @@ pub fn now_rfc3339() -> String {
 /// };
 /// ```
 pub fn after_secs_rfc3339(delta_secs: u64) -> String {
-    let dt = wasip3::clocks::system_clock::now();
-    // seconds is i64; saturate at 0 rather than panic on negative clock readings.
-    let base = dt.seconds.max(0) as u64;
-    format_rfc3339(base + delta_secs, dt.nanoseconds)
+    #[cfg(target_arch = "wasm32")]
+    {
+        let dt = wasip3::clocks::system_clock::now();
+        // seconds is i64; saturate at 0 rather than panic on negative clock readings.
+        let base = dt.seconds.max(0) as u64;
+        format_rfc3339(base + delta_secs, dt.nanoseconds)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format_rfc3339(d.as_secs() + delta_secs, d.subsec_nanos())
+    }
 }
 
 /// Format a Unix timestamp (seconds since epoch + subsecond nanoseconds) as

@@ -96,32 +96,53 @@ wasmtime run \
 
 | Feature      | Default | Description                              |
 |------------- |---------|------------------------------------------|
-| `tls`        | no      | TLS via `wasi:tls` host interface (experimental — custom CAs not yet supported) |
-| `jetstream`  | no      | JetStream API (stream/consumer/Object Store mgmt) |
+| `service`    | yes     | Microservices framework ([ADR-32]) with PING/INFO/STATS/SCHEMA discovery |
 | `kv`         | yes     | NATS KV with CAS, Watch (implies `jetstream`) |
+| `jetstream`  | yes (via `kv`) | JetStream API (stream/consumer/Object Store mgmt, OrderedConsumer, Direct Get) |
+| `tls`        | no      | TLS via `wasi:tls` host interface (experimental — custom CAs not yet supported) |
 | `nkey`       | no      | NKey authentication (Ed25519)            |
 
-## KV watch APIs
+## Microservices (ADR-32)
 
-The KV API includes nats.rs-style watch variants:
+Create discoverable, standardized microservices with built-in PING, INFO, STATS, and SCHEMA endpoints:
 
-- `watch(start_after_seq)` — existing API for replay/new behavior based on
-  sequence.
+```rust,ignore
+use nats_wasip3::{Client, ConnectConfig, ServiceConfig, EndpointConfig};
+
+let client = Client::connect(ConnectConfig::default()).await?;
+
+let mut service = ServiceConfig::new("calculator", "1.0.0")
+    .description("Performs arithmetic calculations")
+    .build(client.clone())
+    .await?;
+
+let mut sub = service.add_endpoint(
+    EndpointConfig::new("add")
+        .subject("calc.add")
+        .queue_group("calc-workers")
+)?;
+
+// Process incoming requests
+while let Ok(req) = sub.next().await {
+    let sum: i64 = serde_json::from_slice(&req.message.payload).unwrap_or(0);
+    req.respond_json(&serde_json::json!({ "result": sum })).await?;
+}
+```
+
+[ADR-32]: https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-32.md
+
+## KV watch and management APIs
+
+The KV API includes nats.rs-style watch variants and key patterns:
+
+- `keys_matching("pattern.*")` — list keys matching a wildcard pattern.
+- `watch(start_after_seq)` — replay/new behavior based on sequence.
 - `watch_all()` — all keys, new updates only.
 - `watch_all_from_revision(revision)` — all keys from a stream revision.
 - `watch_all_with_history()` — latest value per key first, then live updates.
 - `watch_many(keys)` — selected keys, new updates only.
-- `watch_many_with_history(keys)` — selected keys with latest-per-key snapshot,
-  then live updates.
-- `watch_many_from_revision(keys, revision)` — selected keys from a stream
-  revision.
-
-Notes:
-
-- `watch_many*` uses JetStream `filter_subjects` and requires NATS server 2.10+.
-  On older servers the library returns a clear compatibility error.
-- `load_all()` now uses a consumer snapshot (`DeliverPolicy::LastPerSubject`),
-  returning only the latest non-deleted value per key.
+- `watch_many_with_history(keys)` — selected keys with latest-per-key snapshot, then live updates.
+- `watch_many_from_revision(keys, revision)` — selected keys from a stream revision.
 
 ## Quick start
 
