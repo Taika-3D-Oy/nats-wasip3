@@ -6,8 +6,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::client::Duration;
 use crate::jetstream::{
@@ -110,6 +110,7 @@ pub struct ObjectLink {
 impl ObjectStore {
     /// Open or create an Object Store bucket.
     pub async fn new(js: JetStream, config: ObjectStoreConfig) -> Result<Self, Error> {
+        crate::proto::validate_bucket_name(&config.bucket)?;
         let stream_name = format!("{OBJ_STREAM_PREFIX}{}", config.bucket);
         let stream_config = StreamConfig {
             name: stream_name.clone(),
@@ -145,15 +146,16 @@ impl ObjectStore {
     }
 
     /// Open an existing Object Store bucket (does not create it).
-    pub fn open(js: JetStream, bucket: impl Into<String>) -> Self {
+    pub fn open(js: JetStream, bucket: impl Into<String>) -> Result<Self, Error> {
         let bucket = bucket.into();
+        crate::proto::validate_bucket_name(&bucket)?;
         let stream_name = format!("{OBJ_STREAM_PREFIX}{bucket}");
-        Self {
+        Ok(Self {
             js,
             bucket,
             stream_name,
             max_chunk_size: DEFAULT_CHUNK_SIZE,
-        }
+        })
     }
 
     /// Put an object into the bucket.
@@ -224,6 +226,19 @@ impl ObjectStore {
             _ => return Ok(None),
         };
 
+        if meta.size > usize::MAX as u64 {
+            return Err(Error::Protocol(format!(
+                "object size {} exceeds platform memory limits",
+                meta.size
+            )));
+        }
+        if meta.chunks > 100_000 {
+            return Err(Error::Protocol(format!(
+                "object chunk count {} exceeds maximum allowed limit (100000)",
+                meta.chunks
+            )));
+        }
+
         let consumer_cfg = ConsumerConfig {
             durable_name: None,
             filter_subject: Some(self.chunk_subject(&meta.nuid)),
@@ -249,7 +264,8 @@ impl ObjectStore {
         let del = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream_name, info.name);
         let _ = self.js.client().publish_with_reply(&del, &inbox, b"");
 
-        let mut out = Vec::with_capacity(meta.size as usize);
+        let initial_cap = (meta.size as usize).min(64 * 1024 * 1024);
+        let mut out = Vec::with_capacity(initial_cap);
         for msg in msgs {
             out.extend_from_slice(&msg.payload);
         }
@@ -258,7 +274,7 @@ impl ObjectStore {
             return Err(Error::Protocol("object data size mismatch".into()));
         }
 
-        // Verify SHA-256 digest if the metadata carries one.
+        // Verify SHA-256 digest: non-empty objects must have a valid digest matching payload.
         if let Some(ref stored_digest) = meta.digest {
             let actual = compute_digest(&out);
             if actual != *stored_digest {
@@ -266,6 +282,10 @@ impl ObjectStore {
                     "object digest mismatch: stored={stored_digest}, actual={actual}"
                 )));
             }
+        } else if meta.size > 0 {
+            return Err(Error::Protocol(
+                "object missing required SHA-256 digest in metadata".into(),
+            ));
         }
 
         Ok(Some(Object {
@@ -364,7 +384,10 @@ impl ObjectStore {
             ..Default::default()
         };
 
-        let info = self.js.create_consumer(&self.stream_name, &consumer_cfg).await?;
+        let info = self
+            .js
+            .create_consumer(&self.stream_name, &consumer_cfg)
+            .await?;
 
         Ok(ObjectWatcher {
             sub,
@@ -377,7 +400,9 @@ impl ObjectStore {
     /// Create a symbolic link to another object in the same bucket.
     pub async fn link(&self, name: &str, target_name: &str) -> Result<ObjectInfo, Error> {
         if name.is_empty() || target_name.is_empty() {
-            return Err(Error::Protocol("link name and target must not be empty".into()));
+            return Err(Error::Protocol(
+                "link name and target must not be empty".into(),
+            ));
         }
 
         let nuid = generate_chunk_subject_id()?;
@@ -405,7 +430,9 @@ impl ObjectStore {
     /// Create a symbolic link to another bucket.
     pub async fn link_bucket(&self, name: &str, target_bucket: &str) -> Result<ObjectInfo, Error> {
         if name.is_empty() || target_bucket.is_empty() {
-            return Err(Error::Protocol("link name and target bucket must not be empty".into()));
+            return Err(Error::Protocol(
+                "link name and target bucket must not be empty".into(),
+            ));
         }
 
         let nuid = generate_chunk_subject_id()?;
@@ -526,9 +553,12 @@ impl ObjectWatcher {
 
 impl Drop for ObjectWatcher {
     fn drop(&mut self) {
-        let _ = self.sub.unsubscribe();
+        self.sub.unsubscribe();
         let inbox = self.js.client().new_inbox();
-        let del = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream_name, self.consumer_name);
+        let del = format!(
+            "$JS.API.CONSUMER.DELETE.{}.{}",
+            self.stream_name, self.consumer_name
+        );
         let _ = self.js.client().publish_with_reply(&del, &inbox, b"");
     }
 }

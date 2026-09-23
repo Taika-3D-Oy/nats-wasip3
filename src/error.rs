@@ -1,7 +1,7 @@
 use std::fmt;
 
-use wasip3::sockets::types::ErrorCode;
 use wasip3::sockets::ip_name_lookup::ErrorCode as DnsErrorCode;
+use wasip3::sockets::types::ErrorCode;
 
 /// Errors returned by nats-wasi operations.
 #[non_exhaustive]
@@ -58,7 +58,10 @@ impl fmt::Display for Error {
             Error::Disconnected => write!(f, "disconnected"),
             Error::BufferFull => write!(f, "write buffer full"),
             Error::MaxPayloadExceeded { size, max } => {
-                write!(f, "payload too large: {size} bytes exceeds server max {max}")
+                write!(
+                    f,
+                    "payload too large: {size} bytes exceeds server max {max}"
+                )
             }
             Error::Json(msg) => write!(f, "json: {msg}"),
             #[cfg(feature = "jetstream")]

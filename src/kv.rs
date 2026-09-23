@@ -4,7 +4,7 @@
 //! CAS (compare-and-swap) uses the `Nats-Expected-Last-Subject-Sequence` header.
 //! Watch uses an ordered ephemeral consumer.
 
-use crate::client::{Duration, secs};
+use crate::client::{secs, Duration};
 use crate::jetstream::{
     AckPolicy, ConsumerConfig, DeliverPolicy, DiscardPolicy, JetStream, Retention, Storage,
     StreamConfig,
@@ -100,6 +100,7 @@ impl Default for KvConfig {
 impl KeyValue {
     /// Open or create a KV bucket.
     pub async fn new(js: JetStream, config: KvConfig) -> Result<Self, Error> {
+        crate::proto::validate_bucket_name(&config.bucket)?;
         let stream_name = format!("{KV_STREAM_PREFIX}{}", config.bucket);
 
         let stream_config = StreamConfig {
@@ -132,14 +133,15 @@ impl KeyValue {
     }
 
     /// Open an existing KV bucket (does not create it).
-    pub fn open(js: JetStream, bucket: impl Into<String>) -> Self {
+    pub fn open(js: JetStream, bucket: impl Into<String>) -> Result<Self, Error> {
         let bucket = bucket.into();
+        crate::proto::validate_bucket_name(&bucket)?;
         let stream_name = format!("{KV_STREAM_PREFIX}{bucket}");
-        KeyValue {
+        Ok(KeyValue {
             js,
             bucket,
             stream_name,
-        }
+        })
     }
 
     fn subject(&self, key: &str) -> String {
@@ -267,12 +269,7 @@ impl KeyValue {
     /// Requires the bucket to have been created with `allow_msg_ttl: true`
     /// (NATS server 2.11+). The TTL is rounded down to whole seconds, with
     /// a minimum effective value of 1 second.
-    pub async fn put_with_ttl(
-        &self,
-        key: &str,
-        value: &[u8],
-        ttl: Duration,
-    ) -> Result<u64, Error> {
+    pub async fn put_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<u64, Error> {
         let mut headers = Headers::new();
         headers.insert("Nats-TTL", format_ttl(ttl));
         let subject = self.subject(key);
@@ -400,11 +397,7 @@ impl KeyValue {
             expected_revision.to_string(),
         );
         let subject = self.subject(key);
-        match self
-            .js
-            .publish_with_headers(&subject, &headers, b"")
-            .await
-        {
+        match self.js.publish_with_headers(&subject, &headers, b"").await {
             Ok(_) => Ok(()),
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
             Err(e) => Err(e),
@@ -458,11 +451,7 @@ impl KeyValue {
             expected_revision.to_string(),
         );
         let subject = self.subject(key);
-        match self
-            .js
-            .publish_with_headers(&subject, &headers, b"")
-            .await
-        {
+        match self.js.publish_with_headers(&subject, &headers, b"").await {
             Ok(_) => Ok(()),
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
             Err(e) => Err(e),
@@ -486,11 +475,7 @@ impl KeyValue {
         );
         headers.insert("Nats-TTL", format_ttl(ttl));
         let subject = self.subject(key);
-        match self
-            .js
-            .publish_with_headers(&subject, &headers, b"")
-            .await
-        {
+        match self.js.publish_with_headers(&subject, &headers, b"").await {
             Ok(_) => Ok(()),
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
             Err(e) => Err(e),
@@ -654,7 +639,10 @@ impl KeyValue {
         const LOAD_BATCH: u32 = 256;
 
         loop {
-            let msgs = self.js.fetch(&self.stream_name, &info.name, LOAD_BATCH).await?;
+            let msgs = self
+                .js
+                .fetch(&self.stream_name, &info.name, LOAD_BATCH)
+                .await?;
             if msgs.is_empty() {
                 break;
             }
@@ -890,7 +878,8 @@ impl KeyValue {
         T: AsRef<str>,
         K: IntoIterator<Item = T>,
     {
-        self.create_watcher_many(keys, DeliverPolicy::New, None).await
+        self.create_watcher_many(keys, DeliverPolicy::New, None)
+            .await
     }
 
     /// Watch a set of keys delivering the latest value per key first, then live updates.
@@ -942,18 +931,8 @@ impl KeyValue {
         deliver_policy: DeliverPolicy,
         opt_start_seq: Option<u64>,
     ) -> Result<KvWatcher, Error> {
-        // Unique deliver subject for this watcher.
-        let deliver = format!("_kv_watch.{}.{}", self.bucket, {
-            use std::cell::Cell;
-            thread_local! {
-                static CTR: Cell<u64> = const { Cell::new(0) };
-            }
-            CTR.with(|c| {
-                let v = c.get();
-                c.set(v + 1);
-                v
-            })
-        });
+        // Cryptographically random deliver subject for this watcher.
+        let deliver = self.js.client().new_inbox();
 
         let consumer_cfg = ConsumerConfig {
             filter_subject: Some(filter_subject),
@@ -1002,20 +981,13 @@ impl KeyValue {
             .collect::<Vec<_>>();
 
         if filter_subjects.is_empty() {
-            return Err(Error::Protocol("watch_many requires at least one key".into()));
+            return Err(Error::Protocol(
+                "watch_many requires at least one key".into(),
+            ));
         }
 
-        let deliver = format!("_kv_watch.{}.{}", self.bucket, {
-            use std::cell::Cell;
-            thread_local! {
-                static CTR: Cell<u64> = const { Cell::new(0) };
-            }
-            CTR.with(|c| {
-                let v = c.get();
-                c.set(v + 1);
-                v
-            })
-        });
+        // Cryptographically random deliver subject for this watcher.
+        let deliver = self.js.client().new_inbox();
 
         let consumer_cfg = ConsumerConfig {
             filter_subject: None,
@@ -1145,14 +1117,11 @@ fn extract_revision(msg: &crate::client::Message) -> u64 {
     {
         return rev;
     }
-    // Fall back to the reply-to subject which encodes stream_seq at index 5.
-    // Format: $JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts>.<pending>[.<token>]
+    // Fall back to the reply-to subject using MsgMetadata::parse which handles
+    // both JetStream v1 (9-token) and v2 (12-token with domain/account) formats.
     if let Some(ref reply) = msg.reply_to {
-        let parts: Vec<&str> = reply.split('.').collect();
-        if parts.len() >= 9 && parts[0] == "$JS" && parts[1] == "ACK" {
-            if let Ok(seq) = parts[5].parse::<u64>() {
-                return seq;
-            }
+        if let Some(meta) = crate::jetstream::MsgMetadata::parse(reply) {
+            return meta.stream_sequence;
         }
     }
     0
@@ -1218,5 +1187,41 @@ mod tests {
             }
             other => panic!("expected original jetstream error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_revision_from_headers() {
+        let mut headers = crate::proto::Headers::new();
+        headers.insert("Nats-Sequence", "42");
+        let msg = crate::client::Message {
+            subject: "test".into(),
+            reply_to: None,
+            headers: Some(headers),
+            payload: vec![],
+        };
+        assert_eq!(extract_revision(&msg), 42);
+    }
+
+    #[test]
+    fn extract_revision_from_v1_reply() {
+        let msg = crate::client::Message {
+            subject: "test".into(),
+            reply_to: Some("$JS.ACK.KV_bucket.consumer.1.105.1.123456789.0".into()),
+            headers: None,
+            payload: vec![],
+        };
+        assert_eq!(extract_revision(&msg), 105);
+    }
+
+    #[test]
+    fn extract_revision_from_v2_reply() {
+        let msg = crate::client::Message {
+            subject: "test".into(),
+            // v2: $JS.ACK.<domain>.<acc_hash>.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts>.<pending>
+            reply_to: Some("$JS.ACK.domain.acc.KV_bucket.consumer.1.205.1.123456789.0".into()),
+            headers: None,
+            payload: vec![],
+        };
+        assert_eq!(extract_revision(&msg), 205);
     }
 }

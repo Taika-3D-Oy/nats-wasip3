@@ -56,16 +56,15 @@ pub use error::Error;
 // Users should import from the crate root rather than sub-modules.
 
 pub use client::{
-    Client, ConnectConfig, Duration, Message, Subscription,
-    millis, secs, with_timeout,
+    millis, secs, with_timeout, Client, ConnectConfig, Duration, Message, Subscription,
 };
 pub use proto::{Headers, ServerInfo};
 
 #[cfg(feature = "service")]
 pub use service::{
-    EndpointConfig, EndpointInfo, EndpointSchema, EndpointStats, EndpointSubscription,
-    Group, InfoResponse, PingResponse, SchemaResponse, Service, ServiceConfig,
-    ServiceRequest, StatsResponse,
+    EndpointConfig, EndpointInfo, EndpointSchema, EndpointStats, EndpointSubscription, Group,
+    InfoResponse, PingResponse, SchemaResponse, Service, ServiceConfig, ServiceRequest,
+    StatsResponse,
 };
 
 #[cfg(feature = "jetstream")]

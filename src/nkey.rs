@@ -23,7 +23,7 @@ pub struct KeyPair {
 impl KeyPair {
     /// Parse an NKey seed string (starts with `S`).
     pub fn from_seed(seed: &str) -> Result<Self, Error> {
-        let decoded = decode_raw(seed)?;
+        let mut decoded = decode_raw(seed)?;
         if decoded.len() < 34 {
             return Err(Error::Protocol("nkey seed too short".into()));
         }
@@ -45,13 +45,25 @@ impl KeyPair {
         }
 
         // Bytes 2..34 are the 32-byte Ed25519 private seed.
-        let seed_bytes: [u8; 32] = decoded[2..34]
-            .try_into()
-            .map_err(|_| Error::Protocol("nkey seed wrong length".into()))?;
+        let mut seed_bytes: [u8; 32] = match decoded[2..34].try_into() {
+            Ok(b) => b,
+            Err(_) => return Err(Error::Protocol("nkey seed wrong length".into())),
+        };
+
+        let signing = SigningKey::from_bytes(&seed_bytes);
+
+        // Volatile wipe of transient secret buffers in stack and heap memory.
+        for b in seed_bytes.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        for b in decoded.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 
         Ok(KeyPair {
             seed_prefix: prefix2 & 0xF8,
-            signing: SigningKey::from_bytes(&seed_bytes),
+            signing,
         })
     }
 
@@ -71,6 +83,20 @@ impl KeyPair {
         let sig = self.signing.sign(nonce);
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes())
+    }
+}
+
+impl Drop for KeyPair {
+    fn drop(&mut self) {
+        // Volatile wipe of signing key memory footprint upon drop.
+        let ptr = &mut self.signing as *mut SigningKey as *mut u8;
+        let size = std::mem::size_of::<SigningKey>();
+        for i in 0..size {
+            unsafe {
+                std::ptr::write_volatile(ptr.add(i), 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -171,7 +197,8 @@ mod tests {
         let sig = kp.sign(b"test-nonce");
         // base64url-no-pad: only alphanumeric, '-', '_'
         assert!(
-            sig.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            sig.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "signature contains invalid chars: {sig}"
         );
         // Ed25519 signature is 64 bytes → 86 base64 chars (no pad)
@@ -185,6 +212,13 @@ mod tests {
         let sig1 = kp.sign(b"nonce-a");
         let sig2 = kp.sign(b"nonce-b");
         assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn drop_zeroizes_keypair() {
+        let seed = make_user_seed(&[42u8; 32]);
+        let kp = KeyPair::from_seed(&seed).unwrap();
+        drop(kp);
     }
 
     #[test]

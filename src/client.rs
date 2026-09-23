@@ -25,8 +25,6 @@ use wit_bindgen::{FutureReader, StreamReader, StreamResult, StreamWriter};
 use crate::proto::{self, ConnectOptions, Headers, ServerInfo, ServerOp};
 use crate::Error;
 
-
-
 // ── Public types ───────────────────────────────────────────────────
 
 /// A received message (unified from MSG and HMSG).
@@ -55,11 +53,17 @@ impl Subscription {
         .await
     }
 
+    /// Return the subscription ID (SID).
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+
     /// Unsubscribe immediately. Equivalent to dropping the subscription, but
     /// explicit and does not require ownership.
     pub fn unsubscribe(&self) {
         let mut inner = self.inner.borrow_mut();
-        if inner.mailboxes.remove(&self.sid).is_none() {
+        let mailbox = inner.mailboxes.remove(&self.sid);
+        if mailbox.is_none() {
             return; // already unsubscribed
         }
         inner.subscriptions.remove(&self.sid);
@@ -67,6 +71,11 @@ impl Subscription {
         inner.write_buf.extend_from_slice(&unsub);
         if let Some(w) = inner.flush_waker.take() {
             w.wake();
+        }
+        if let Some(mb) = mailbox {
+            if let Some(w) = mb.waker {
+                w.wake();
+            }
         }
     }
 
@@ -86,7 +95,8 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
         // If unsubscribe() was called explicitly, mailbox is already gone.
-        if inner.mailboxes.remove(&self.sid).is_none() {
+        let mailbox = inner.mailboxes.remove(&self.sid);
+        if mailbox.is_none() {
             return;
         }
         inner.subscriptions.remove(&self.sid);
@@ -94,6 +104,11 @@ impl Drop for Subscription {
         inner.write_buf.extend_from_slice(&unsub);
         if let Some(w) = inner.flush_waker.take() {
             w.wake();
+        }
+        if let Some(mb) = mailbox {
+            if let Some(w) = mb.waker {
+                w.wake();
+            }
         }
     }
 }
@@ -152,6 +167,9 @@ pub struct ConnectConfig {
     /// will not deliver messages published by this client to its own
     /// subscriptions. Default: `false`.
     pub no_echo: bool,
+    /// Whether to accept and connect to server-advertised cluster URLs (`connect_urls` from server INFO).
+    /// Disabled by default (`false`) to prevent server topology injection / SSRF.
+    pub allow_advertised_servers: bool,
 }
 
 impl Default for ConnectConfig {
@@ -176,6 +194,7 @@ impl Default for ConnectConfig {
             subscription_capacity: 512,
             max_pending_write_bytes: 8 * 1024 * 1024,
             no_echo: false,
+            allow_advertised_servers: false,
         }
     }
 }
@@ -215,13 +234,14 @@ struct Inner {
     /// Cumulative count of PONGs received since connection start.
     pongs_received: u64,
     next_id: u64,
-    /// Xorshift64 state for pseudo-random inbox tokens and jitter.
-    /// Seeded from the monotonic clock at connection time.
-    rng: u64,
     closed: bool,
     close_error: Option<String>,
     /// Set by reconnect logic; picked up by the flush loop.
     new_writer: Option<StreamWriter<u8>>,
+    /// Whether the current writer encountered an I/O failure and needs reconnect replacement.
+    writer_failed: bool,
+    /// Whether to accept cluster node URLs learned from server INFO.
+    allow_advertised_servers: bool,
     /// Cluster node URLs learned from server INFO `connect_urls`.
     known_servers: Vec<String>,
     /// Maximum pending messages per subscription mailbox.
@@ -274,6 +294,11 @@ impl Drop for Client {
 impl Client {
     /// Connect to a NATS server and start background I/O loops.
     pub async fn connect(config: ConnectConfig) -> Result<Self, Error> {
+        let mut config = config;
+        if config.address.starts_with("tls://") || config.address.starts_with("nats+tls://") {
+            config.tls = true;
+        }
+
         let sock_addr = parse_address(&config.address).await?;
         let family = match sock_addr {
             IpSocketAddress::Ipv4(_) => IpAddressFamily::Ipv4,
@@ -322,13 +347,7 @@ impl Client {
                 let server_name = config
                     .tls_server_name
                     .clone()
-                    .unwrap_or_else(|| {
-                        config
-                            .address
-                            .rsplit_once(':')
-                            .map(|(h, _)| h.to_string())
-                            .unwrap_or_default()
-                    });
+                    .unwrap_or_else(|| extract_server_name(&config.address));
                 crate::tls::tls_upgrade(rx, tx, &server_name).await?
             }
             #[cfg(not(feature = "tls"))]
@@ -338,11 +357,9 @@ impl Client {
         };
 
         // ── Shared state setup ─────────────────────────────────
-        // Seed the PRNG from the monotonic clock; XOR with a fixed salt so
-        // that a zero clock reading still produces a valid non-zero state.
-        let mut rng = wasip3::clocks::monotonic_clock::now() ^ 0xcafe_babe_dead_beef;
-        let r1 = xorshift64(&mut rng);
-        let r2 = xorshift64(&mut rng);
+        // Generate unpredictable inbox prefix using cryptographically secure random numbers.
+        let r1 = crypto_random_u64();
+        let r2 = crypto_random_u64();
         let inbox_prefix = format!("_INBOX.{r1:016x}{r2:016x}.");
         let mux_subject = format!("{inbox_prefix}*");
         let mux_sid = "0".to_string();
@@ -395,11 +412,16 @@ impl Client {
             pong_wakers: Vec::new(),
             pongs_received: 0,
             next_id: 1,
-            rng,
             closed: false,
             close_error: None,
             new_writer: None,
-            known_servers: info.connect_urls.clone(),
+            writer_failed: false,
+            allow_advertised_servers: config.allow_advertised_servers,
+            known_servers: if config.allow_advertised_servers {
+                info.connect_urls.clone()
+            } else {
+                Vec::new()
+            },
             mailbox_capacity: config.subscription_capacity,
             write_buf_limit: config.max_pending_write_bytes,
             max_payload: info.max_payload,
@@ -547,7 +569,7 @@ impl Client {
 
         let (token, reply_to) = {
             let mut inner = self.inner.borrow_mut();
-            let r = xorshift64(&mut inner.rng);
+            let r = crypto_random_u64();
             let token = format!("{r:016x}");
             let reply_to = format!("{}{token}", inner.inbox_prefix);
             inner.pending_requests.insert(
@@ -591,7 +613,7 @@ impl Client {
 
         let (token, reply_to) = {
             let mut inner = self.inner.borrow_mut();
-            let r = xorshift64(&mut inner.rng);
+            let r = crypto_random_u64();
             let token = format!("{r:016x}");
             let reply_to = format!("{}{token}", inner.inbox_prefix);
             inner.pending_requests.insert(
@@ -656,7 +678,14 @@ impl Client {
             }
             target
         };
-        with_timeout(timeout, PongWait { inner: &self.inner, target_pongs }).await?
+        with_timeout(
+            timeout,
+            PongWait {
+                inner: &self.inner,
+                target_pongs,
+            },
+        )
+        .await?
     }
 
     fn next_sid(&self) -> String {
@@ -666,11 +695,30 @@ impl Client {
         id.to_string()
     }
 
-    pub(crate) fn new_inbox(&self) -> String {
-        let mut inner = self.inner.borrow_mut();
-        let r1 = xorshift64(&mut inner.rng);
-        let r2 = xorshift64(&mut inner.rng);
+    /// Generate a unique cryptographically random inbox subject (e.g. `_INBOX.<random>`).
+    pub fn new_inbox(&self) -> String {
+        let r1 = crypto_random_u64();
+        let r2 = crypto_random_u64();
         format!("_INBOX.{r1:016x}{r2:016x}")
+    }
+
+    pub(crate) fn unsubscribe_sid(&self, sid: &str) {
+        let mut inner = self.inner.borrow_mut();
+        let mailbox = inner.mailboxes.remove(sid);
+        if mailbox.is_none() {
+            return;
+        }
+        inner.subscriptions.remove(sid);
+        let unsub = proto::encode_unsub(sid, None);
+        inner.write_buf.extend_from_slice(&unsub);
+        if let Some(w) = inner.flush_waker.take() {
+            w.wake();
+        }
+        if let Some(mb) = mailbox {
+            if let Some(w) = mb.waker {
+                w.wake();
+            }
+        }
     }
 
     fn check_payload_size(&self, len: usize) -> Result<(), Error> {
@@ -790,14 +838,37 @@ fn extract_creds_field(content: &str, tag: &str) -> Option<String> {
             }
         }
     }
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
-/// Parse "host:port" into a P3 `IpSocketAddress`.
+/// Parse "host:port", "nats://host:port", or "[ipv6]:port" into a P3 `IpSocketAddress`.
 async fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
-    let (host, port_str) = addr
-        .rsplit_once(':')
-        .ok_or_else(|| Error::Protocol(format!("invalid address (no port): {addr}")))?;
+    let addr = addr.trim();
+    let addr = addr
+        .strip_prefix("nats://")
+        .or_else(|| addr.strip_prefix("tls://"))
+        .or_else(|| addr.strip_prefix("nats+tls://"))
+        .unwrap_or(addr);
+
+    let (host, port_str) = if addr.starts_with('[') {
+        if let Some(end_bracket) = addr.find(']') {
+            let host = &addr[1..end_bracket];
+            let rest = &addr[end_bracket + 1..];
+            let port_str = rest.strip_prefix(':').ok_or_else(|| {
+                Error::Protocol(format!("invalid address (no port after bracket): {addr}"))
+            })?;
+            (host, port_str)
+        } else {
+            return Err(Error::Protocol(format!("unmatched '[' in address: {addr}")));
+        }
+    } else {
+        addr.rsplit_once(':')
+            .ok_or_else(|| Error::Protocol(format!("invalid address (no port): {addr}")))?
+    };
     let port: u16 = port_str
         .parse()
         .map_err(|_| Error::Protocol(format!("invalid port: {port_str}")))?;
@@ -840,7 +911,11 @@ async fn parse_address(addr: &str) -> Result<IpSocketAddress, Error> {
 
 /// Read from a P3 `StreamReader<u8>`, appending to `buf`. Returns `(bytes_read, scratch)`.
 /// The caller should pass the returned `scratch` back on the next call to reuse the allocation.
-async fn stream_read(rx: &mut StreamReader<u8>, buf: &mut Vec<u8>, scratch: Vec<u8>) -> (usize, Vec<u8>) {
+async fn stream_read(
+    rx: &mut StreamReader<u8>,
+    buf: &mut Vec<u8>,
+    scratch: Vec<u8>,
+) -> (usize, Vec<u8>) {
     let (status, mut data) = rx.read(scratch).await;
     match status {
         StreamResult::Complete(n) => {
@@ -854,7 +929,10 @@ async fn stream_read(rx: &mut StreamReader<u8>, buf: &mut Vec<u8>, scratch: Vec<
 
 /// Write owned bytes to a P3 `StreamWriter<u8>` without extra allocation.
 /// Returns unwritten bytes on failure so they can be requeued without loss.
-async fn stream_write_vec(tx: &mut StreamWriter<u8>, data: Vec<u8>) -> Result<(), (Vec<u8>, Error)> {
+async fn stream_write_vec(
+    tx: &mut StreamWriter<u8>,
+    data: Vec<u8>,
+) -> Result<(), (Vec<u8>, Error)> {
     let remaining = tx.write_all(data).await;
     if !remaining.is_empty() {
         return Err((remaining, Error::Disconnected));
@@ -864,7 +942,9 @@ async fn stream_write_vec(tx: &mut StreamWriter<u8>, data: Vec<u8>) -> Result<()
 
 /// Write all bytes from a slice to a P3 `StreamWriter<u8>`.
 async fn stream_write_all(tx: &mut StreamWriter<u8>, data: &[u8]) -> Result<(), Error> {
-    stream_write_vec(tx, data.to_vec()).await.map_err(|(_, e)| e)
+    stream_write_vec(tx, data.to_vec())
+        .await
+        .map_err(|(_, e)| e)
 }
 
 // ── Futures: subscription / request ────────────────────────────────
@@ -951,7 +1031,10 @@ impl<'a> Future for PongWait<'a> {
         if inner.pongs_received >= self.target_pongs {
             Poll::Ready(Ok(()))
         } else {
-            inner.pong_wakers.push(cx.waker().clone());
+            let waker = cx.waker();
+            if !inner.pong_wakers.iter().any(|w| w.will_wake(waker)) {
+                inner.pong_wakers.push(waker.clone());
+            }
             Poll::Pending
         }
     }
@@ -1013,6 +1096,22 @@ async fn read_loop(
             }
         }
 
+        let max_inbound = {
+            let max_p = inner.borrow().max_payload;
+            if max_p > 0 {
+                max_p + 65536
+            } else {
+                8 * 1024 * 1024 + 65536
+            }
+        };
+        if buf.len() > max_inbound {
+            let mut inner = inner.borrow_mut();
+            inner.closed = true;
+            inner.close_error = Some("inbound buffer limit exceeded".into());
+            wake_all(&mut inner);
+            return;
+        }
+
         let mut consumed_total = 0;
         loop {
             match proto::parse_op(&buf[consumed_total..]) {
@@ -1067,12 +1166,18 @@ async fn attempt_reconnect(
         if inner.borrow().closed {
             return None;
         }
-        delay = if delay + delay < cap { delay + delay } else { cap };
-        // Add ±25% jitter using the PRNG to spread out reconnection storms.
+        delay = if delay + delay < cap {
+            delay + delay
+        } else {
+            cap
+        };
+        // Add ±25% jitter using CSPRNG to spread out reconnection storms.
         let jitter_range = delay / 4;
-        let rand_val = xorshift64(&mut inner.borrow_mut().rng);
+        let rand_val = crypto_random_u64();
         let jitter_offset = rand_val % jitter_range.max(1);
-        delay = delay.saturating_sub(jitter_range / 2).saturating_add(jitter_offset);
+        delay = delay
+            .saturating_sub(jitter_range / 2)
+            .saturating_add(jitter_offset);
 
         let addr = candidates[attempt as usize % ncandidates].clone();
         let sock_addr = match parse_address(&addr).await {
@@ -1113,8 +1218,8 @@ async fn attempt_reconnect(
             None => continue,
         };
 
-        // Absorb any new cluster URLs so subsequent attempts can try them.
-        if !info.connect_urls.is_empty() {
+        // Absorb any new cluster URLs only if configured to allow advertised servers.
+        if config.allow_advertised_servers && !info.connect_urls.is_empty() {
             let mut inner_ref = inner.borrow_mut();
             for url in &info.connect_urls {
                 if !candidates.contains(url) {
@@ -1137,11 +1242,7 @@ async fn attempt_reconnect(
                 let server_name = config
                     .tls_server_name
                     .clone()
-                    .unwrap_or_else(|| {
-                        addr.rsplit_once(':')
-                            .map(|(h, _)| h.to_string())
-                            .unwrap_or_default()
-                    });
+                    .unwrap_or_else(|| extract_server_name(&addr));
                 match crate::tls::tls_upgrade(rx, tx, &server_name).await {
                     Ok(pair) => pair,
                     Err(_) => continue,
@@ -1237,6 +1338,7 @@ async fn attempt_reconnect(
             let mut inner_ref = inner.borrow_mut();
             inner_ref._socket = Some(socket);
             inner_ref.new_writer = Some(tx);
+            inner_ref.writer_failed = false;
             if let Some(w) = inner_ref.flush_waker.take() {
                 w.wake();
             }
@@ -1267,9 +1369,55 @@ fn is_permanent_auth_error(msg: &str) -> bool {
         || m.contains("user authentication revoked")
 }
 
+/// Generate a cryptographically secure random u64.
+/// On wasm32, this calls the native WASI P3 random interface (`wasip3::random::random::get_random_u64`).
+/// On non-wasm targets (e.g. host testing), a robust fallback is used.
+pub(crate) fn crypto_random_u64() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasip3::random::random::get_random_u64()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::SystemTime;
+        static SEQ: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
+        let seq = SEQ.fetch_add(0x9e3779b97f4a7c15, Ordering::Relaxed);
+        let d = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        let nanos = d.as_nanos() as u64;
+        let mut x = nanos ^ seq ^ 0x517cc1b727220a95;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+}
+
+/// Extract server name for TLS SNI, handling IPv6 bracketed literals like "[::1]:4222"
+/// and stripping URL schemes.
+pub(crate) fn extract_server_name(addr: &str) -> String {
+    let addr = addr.trim();
+    let addr = addr
+        .strip_prefix("nats://")
+        .or_else(|| addr.strip_prefix("tls://"))
+        .or_else(|| addr.strip_prefix("nats+tls://"))
+        .unwrap_or(addr);
+    if let Some(stripped) = addr.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(addr).to_string()
+    } else {
+        addr.rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| addr.to_string())
+    }
+}
+
 /// Xorshift64 PRNG — advances `state` and returns the next pseudo-random u64.
 /// `state` must never be 0; the seed initialisation in `Inner` guarantees this
 /// via the XOR with a non-zero salt.
+#[cfg(test)]
 #[inline]
 fn xorshift64(state: &mut u64) -> u64 {
     let mut x = *state;
@@ -1324,9 +1472,10 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
         }
         ServerOp::Ok => {}
         ServerOp::Info(new_info) => {
-            // Update known cluster nodes when server pushes topology changes.
-            if !new_info.connect_urls.is_empty() {
-                inner.borrow_mut().known_servers = new_info.connect_urls;
+            // Update known cluster nodes when server pushes topology changes only if allowed by config.
+            let mut inner = inner.borrow_mut();
+            if inner.allow_advertised_servers && !new_info.connect_urls.is_empty() {
+                inner.known_servers = new_info.connect_urls;
             }
         }
         ServerOp::Err(msg) => {
@@ -1395,6 +1544,7 @@ async fn flush_loop(inner: Rc<RefCell<Inner>>, mut writer: StreamWriter<u8>) {
             let mut inner_ref = inner.borrow_mut();
             if let Some(new_writer) = inner_ref.new_writer.take() {
                 writer = new_writer;
+                inner_ref.writer_failed = false;
             }
         }
 
@@ -1416,6 +1566,7 @@ async fn flush_loop(inner: Rc<RefCell<Inner>>, mut writer: StreamWriter<u8>) {
             let mut requeued = unwritten;
             requeued.extend_from_slice(&inner_ref.write_buf);
             inner_ref.write_buf = requeued;
+            inner_ref.writer_failed = true;
             continue;
         }
     }
@@ -1430,7 +1581,11 @@ impl<'a> Future for FlushWait<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.closed || !inner.write_buf.is_empty() {
+        if inner.closed {
+            Poll::Ready(())
+        } else if inner.new_writer.is_some() {
+            Poll::Ready(())
+        } else if !inner.write_buf.is_empty() && !inner.writer_failed {
             Poll::Ready(())
         } else {
             inner.flush_waker = Some(cx.waker().clone());
@@ -1449,7 +1604,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1_000 {
             let v = xorshift64(&mut state);
-            assert!(seen.insert(v), "xorshift64 produced a duplicate in the first 1000 outputs");
+            assert!(
+                seen.insert(v),
+                "xorshift64 produced a duplicate in the first 1000 outputs"
+            );
         }
     }
 
@@ -1472,7 +1630,10 @@ mod tests {
         assert!(inbox.starts_with("_INBOX."), "wrong prefix");
         let token = &inbox["_INBOX.".len()..];
         assert_eq!(token.len(), 32, "token should be 32 hex chars");
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in token");
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "non-hex char in token"
+        );
     }
 
     #[test]
@@ -1488,10 +1649,11 @@ mod tests {
             pong_wakers: Vec::new(),
             pongs_received: 0,
             next_id: 1,
-            rng: 12345,
             closed: false,
             close_error: None,
             new_writer: None,
+            writer_failed: false,
+            allow_advertised_servers: false,
             known_servers: Vec::new(),
             mailbox_capacity: 64,
             write_buf_limit: 1024,
@@ -1522,7 +1684,10 @@ mod tests {
 
         {
             let mut inner_mut = inner.borrow_mut();
-            let slot = inner_mut.pending_requests.get_mut(&token).expect("slot exists");
+            let slot = inner_mut
+                .pending_requests
+                .get_mut(&token)
+                .expect("slot exists");
             let resp = slot.response.take().expect("got response");
             assert_eq!(resp.payload, b"pong-response");
         }
@@ -1534,7 +1699,10 @@ mod tests {
         };
         assert!(inner.borrow().pending_requests.contains_key(&token));
         drop(req_fut);
-        assert!(!inner.borrow().pending_requests.contains_key(&token), "drop must remove pending request slot");
+        assert!(
+            !inner.borrow().pending_requests.contains_key(&token),
+            "drop must remove pending request slot"
+        );
     }
 
     #[test]
@@ -1550,10 +1718,11 @@ mod tests {
             pong_wakers: Vec::new(),
             pongs_received: 0,
             next_id: 1,
-            rng: 12345,
             closed: false,
             close_error: None,
             new_writer: None,
+            writer_failed: false,
+            allow_advertised_servers: false,
             known_servers: Vec::new(),
             mailbox_capacity: 64,
             write_buf_limit: 1024,
@@ -1565,5 +1734,129 @@ mod tests {
         assert_eq!(inner.borrow().pongs_received, 1);
         dispatch_op(&inner, ServerOp::Pong);
         assert_eq!(inner.borrow().pongs_received, 2);
+    }
+
+    #[test]
+    fn crypto_random_u64_produces_values() {
+        let v1 = crypto_random_u64();
+        let v2 = crypto_random_u64();
+        // Probability of collision between two 64-bit random numbers is 2^-64
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn extract_server_name_handles_ipv4_and_ipv6() {
+        assert_eq!(extract_server_name("demo.nats.io:4222"), "demo.nats.io");
+        assert_eq!(extract_server_name("127.0.0.1:4222"), "127.0.0.1");
+        assert_eq!(extract_server_name("[::1]:4222"), "::1");
+        assert_eq!(extract_server_name("[2001:db8::1]:4222"), "2001:db8::1");
+        assert_eq!(extract_server_name("demo.nats.io"), "demo.nats.io");
+        assert_eq!(
+            extract_server_name("tls://demo.nats.io:4222"),
+            "demo.nats.io"
+        );
+        assert_eq!(extract_server_name("nats://127.0.0.1:4222"), "127.0.0.1");
+        assert_eq!(extract_server_name("nats+tls://[::1]:4222"), "::1");
+    }
+
+    #[test]
+    fn unsubscribe_sid_removes_mailbox_and_wakes_waiter() {
+        let inner = Rc::new(RefCell::new(Inner {
+            _socket: None,
+            mailboxes: HashMap::new(),
+            subscriptions: HashMap::new(),
+            pending_requests: HashMap::new(),
+            inbox_prefix: "_INBOX.test.".to_string(),
+            write_buf: Vec::new(),
+            flush_waker: None,
+            pong_wakers: Vec::new(),
+            pongs_received: 0,
+            next_id: 1,
+            closed: false,
+            close_error: None,
+            new_writer: None,
+            writer_failed: false,
+            allow_advertised_servers: false,
+            known_servers: Vec::new(),
+            mailbox_capacity: 64,
+            write_buf_limit: 1024,
+            max_payload: 1024,
+        }));
+
+        let client = Client {
+            inner: Rc::clone(&inner),
+            info: Rc::new(ServerInfo {
+                server_id: "test".into(),
+                server_name: "test".into(),
+                version: "1.0.0".into(),
+                host: "localhost".into(),
+                port: 4222,
+                max_payload: 1024,
+                headers: true,
+                tls_required: false,
+                tls_available: false,
+                connect_urls: vec![],
+                nonce: None,
+                jetstream: true,
+            }),
+            refcount: Rc::new(Cell::new(1)),
+        };
+
+        let sid = "sub_1";
+        inner.borrow_mut().mailboxes.insert(
+            sid.to_string(),
+            Mailbox {
+                queue: VecDeque::new(),
+                waker: None,
+            },
+        );
+
+        assert!(inner.borrow().mailboxes.contains_key(sid));
+        client.unsubscribe_sid(sid);
+        assert!(!inner.borrow().mailboxes.contains_key(sid));
+        assert!(inner.borrow().write_buf.starts_with(b"UNSUB sub_1\r\n"));
+    }
+
+    #[test]
+    fn pong_wait_deduplicates_wakers() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        let inner = Rc::new(RefCell::new(Inner {
+            _socket: None,
+            mailboxes: HashMap::new(),
+            subscriptions: HashMap::new(),
+            pending_requests: HashMap::new(),
+            inbox_prefix: "_INBOX.test.".to_string(),
+            write_buf: Vec::new(),
+            flush_waker: None,
+            pong_wakers: Vec::new(),
+            pongs_received: 0,
+            next_id: 1,
+            closed: false,
+            close_error: None,
+            new_writer: None,
+            writer_failed: false,
+            allow_advertised_servers: false,
+            known_servers: Vec::new(),
+            mailbox_capacity: 64,
+            write_buf_limit: 1024,
+            max_payload: 1024,
+        }));
+
+        let mut pong_wait = PongWait {
+            inner: &inner,
+            target_pongs: 1,
+        };
+
+        // Polling multiple times with same waker should not duplicate
+        let _ = Pin::new(&mut pong_wait).poll(&mut cx);
+        assert_eq!(inner.borrow().pong_wakers.len(), 1);
+        let _ = Pin::new(&mut pong_wait).poll(&mut cx);
+        assert_eq!(inner.borrow().pong_wakers.len(), 1);
     }
 }

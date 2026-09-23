@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] – 2026-09-23
+
+### Security
+
+- **Cryptographic CSPRNG**: Replaced monotonic-clock PRNG (`xorshift64`) with native WASI 0.3 CSPRNG (`wasip3::random::random::get_random_u64`) across inbox prefix generation, request tokens (`request` & `request_with_headers`), `new_inbox()`, and reconnection jitter calculation.
+- **Untrusted Server Advertisement Protection**: Added `ConnectConfig.allow_advertised_servers: bool` (default: `false`) to prevent rogue servers from poisoning client reconnect candidate pools. Added `extract_server_name` to safely extract TLS Server Name Indication (SNI) from host addresses, including bracketed IPv6 literals (e.g. `[::1]:4222`).
+- **Bucket Name Injection Defense**: Added strict alphanumeric validation (`validate_bucket_name`) on bucket names across KV and Object Store, preventing wildcard and delimiter injection attacks.
+- **Header Smuggling Prevention**: Hardened `Headers::insert` to sanitize null bytes, colons in keys, and control characters. Added `Headers::try_insert` returning protocol errors on invalid inputs.
+- **Object Store Allocation Bounds & Integrity**: Capped initial object buffer allocations to 64MB and enforced maximum chunk count (`<= 100,000`) to protect against WASM host memory exhaustion. Enforced mandatory SHA-256 digest validation on non-empty objects.
+- **Secret Memory Zeroization**: Added volatile zeroization of transient seed buffers, decoded arrays, and `KeyPair` on drop in `nkey`.
+- **Unbounded Inbound Buffer Protection**: Guarded reader buffer against unbounded growth (`max_payload + 64KB`) from malformed message streams without CRLF delimiters.
+- **Microservice Control Subscription Cleanup**: `Service::stop` and `Drop for Service` now cleanly unsubscribe from all 12 discovery control verbs and wake background listener fibers, preventing orphan subscriptions and fiber leaks.
+
+### Changed
+
+- **`KeyValue::open` and `ObjectStore::open`**: Now return `Result<Self, Error>` instead of infallible `Self` to validate bucket names against subject injection attacks.
+- **Subscription Teardown**: `Subscription::unsubscribe` and `Drop for Subscription` now explicitly wake awaiting mailbox wakers, cleanly terminating consumer loops with `Error::Disconnected`.
+
+### Added
+
+- **`Headers::try_insert`**: Fallible header insertion returning error on control characters or malformed keys.
+- **`Subscription::sid()`**: Public getter for subscription ID.
+- **Comprehensive Unit Tests**: Added unit tests for cryptographic randomness, SNI extraction, subscription teardown, and JetStream v1/v2 ACK metadata parsing.
+
 ## [0.12.0] – 2026-08-28
 
 ### Added

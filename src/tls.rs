@@ -47,12 +47,22 @@ pub async fn tls_upgrade(
         .await
         .map_err(|e| Error::Tls(e.to_debug_string()))?;
 
-    // Monitor error futures so they don't leak.
+    // Monitor error futures so they don't leak, and report host TLS alert/stream errors.
     wit_bindgen::spawn(async move {
-        let _ = send_error_future.await;
+        if let Err(e) = send_error_future.await {
+            eprintln!(
+                "[nats-wasip3] TLS send stream error: {}",
+                e.to_debug_string()
+            );
+        }
     });
     wit_bindgen::spawn(async move {
-        let _ = recv_error_future.await;
+        if let Err(e) = recv_error_future.await {
+            eprintln!(
+                "[nats-wasip3] TLS receive stream error: {}",
+                e.to_debug_string()
+            );
+        }
     });
 
     Ok((cleartext_from_net, cleartext_tx))

@@ -86,7 +86,10 @@ async fn run() -> Result<(), nats_wasip3::Error> {
     let stats = client
         .request("$SRV.STATS.math-service", b"", nats_wasip3::secs(5))
         .await?;
-    println!("STATS response: {}", String::from_utf8_lossy(&stats.payload));
+    println!(
+        "STATS response: {}",
+        String::from_utf8_lossy(&stats.payload)
+    );
 
     let _ = echo_handle;
     let _ = add_handle;

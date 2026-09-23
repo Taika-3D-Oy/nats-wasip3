@@ -327,6 +327,10 @@ fn days_to_ymd(z: i64) -> (i32, u32, u32) {
     let mp = (5 * doy + 2) / 153; // month part [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
-    let y = if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 };
+    let y = if m <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
     (y as i32, m as u32, d as u32)
 }

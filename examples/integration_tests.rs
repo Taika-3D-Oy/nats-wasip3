@@ -24,8 +24,8 @@
 //!     --env NATS_URL=127.0.0.1:14222 --env NATS_TLS_URL=127.0.0.1:4223 \
 //!     target/wasm32-wasip3/debug/examples/integration_tests.wasm
 
-use nats_wasip3::{Client, ConnectConfig, Headers, secs, millis, with_timeout};
 use nats_wasip3::client::Message;
+use nats_wasip3::{millis, secs, with_timeout, Client, ConnectConfig, Headers};
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -44,7 +44,8 @@ async fn connect() -> Client {
 
 fn assert_payload(msg: &Message, expected: &[u8]) {
     assert_eq!(
-        msg.payload, expected,
+        msg.payload,
+        expected,
         "payload mismatch: got {:?}",
         String::from_utf8_lossy(&msg.payload)
     );
@@ -180,10 +181,7 @@ async fn test_request_reply() {
         client2.publish(reply_to, &msg.payload).unwrap();
     });
 
-    let reply = client
-        .request("test.echo", b"ping", secs(3))
-        .await
-        .unwrap();
+    let reply = client.request("test.echo", b"ping", secs(3)).await.unwrap();
     assert_payload(&reply, b"ping");
 }
 
@@ -456,7 +454,9 @@ async fn test_jetstream_publish_with_headers() {
 
 #[cfg(feature = "jetstream")]
 async fn test_push_consumer() {
-    use nats_wasip3::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{
+        AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig,
+    };
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -700,7 +700,7 @@ async fn test_kv_open_existing() {
     kv1.put("hello", b"world").await.unwrap();
 
     // Open existing bucket without creating.
-    let kv2 = KeyValue::open(js.clone(), "opentest");
+    let kv2 = KeyValue::open(js.clone(), "opentest").unwrap();
     assert_eq!(kv2.bucket(), "opentest");
     let entry = kv2.get("hello").await.unwrap().unwrap();
     assert_eq!(entry.value, b"world");
@@ -894,7 +894,9 @@ async fn test_publish_max_payload_boundary() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_fetch_empty_stream() {
-    use nats_wasip3::jetstream::{AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig};
+    use nats_wasip3::jetstream::{
+        AckPolicy, ConsumerConfig, DeliverPolicy, JetStream, StreamConfig,
+    };
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -1128,7 +1130,11 @@ async fn test_object_store_put_get() {
     assert_eq!(info.size, 11);
     assert!(!info.deleted);
 
-    let obj = store.get("hello.txt").await.unwrap().expect("object should exist");
+    let obj = store
+        .get("hello.txt")
+        .await
+        .unwrap()
+        .expect("object should exist");
     assert_eq!(obj.info.name, "hello.txt");
     assert_eq!(obj.data, b"hello world");
 
@@ -1237,15 +1243,25 @@ async fn test_object_store_overwrite() {
     .unwrap();
 
     store.put("versioned.dat", b"version 1").await.unwrap();
-    store.put("versioned.dat", b"version 2 updated").await.unwrap();
+    store
+        .put("versioned.dat", b"version 2 updated")
+        .await
+        .unwrap();
 
     // Only the latest version should be returned.
-    let obj = store.get("versioned.dat").await.unwrap().expect("should exist");
+    let obj = store
+        .get("versioned.dat")
+        .await
+        .unwrap()
+        .expect("should exist");
     assert_eq!(obj.data, b"version 2 updated");
 
     // List should show the object only once.
     let items = store.list().await.unwrap();
-    assert_eq!(items.iter().filter(|i| i.name == "versioned.dat").count(), 1);
+    assert_eq!(
+        items.iter().filter(|i| i.name == "versioned.dat").count(),
+        1
+    );
 
     js.delete_stream("OBJ_objtest_ow").await.unwrap();
 }
@@ -1309,7 +1325,11 @@ async fn test_object_store_info() {
     assert!(none.is_none());
 
     store.put("readme.md", b"# Hello").await.unwrap();
-    let info = store.info("readme.md").await.unwrap().expect("should have info");
+    let info = store
+        .info("readme.md")
+        .await
+        .unwrap()
+        .expect("should have info");
     assert_eq!(info.name, "readme.md");
     assert_eq!(info.size, 7);
     assert_eq!(info.bucket, "objtest_info");
@@ -1373,9 +1393,13 @@ async fn test_object_store_open_existing() {
     store1.put("persist.txt", b"persistent").await.unwrap();
 
     // Open without creating.
-    let store2 = ObjectStore::open(js.clone(), "objtest_open");
+    let store2 = ObjectStore::open(js.clone(), "objtest_open").unwrap();
     assert_eq!(store2.bucket(), "objtest_open");
-    let obj = store2.get("persist.txt").await.unwrap().expect("should exist");
+    let obj = store2
+        .get("persist.txt")
+        .await
+        .unwrap()
+        .expect("should exist");
     assert_eq!(obj.data, b"persistent");
 
     js.delete_stream("OBJ_objtest_open").await.unwrap();
@@ -1460,7 +1484,11 @@ async fn test_kv_put_with_ttl() {
 
     // 2 s TTL.
     kv.put_with_ttl("ephemeral", b"v", secs(2)).await.unwrap();
-    let entry = kv.get("ephemeral").await.unwrap().expect("exists initially");
+    let entry = kv
+        .get("ephemeral")
+        .await
+        .unwrap()
+        .expect("exists initially");
     assert_eq!(entry.value, b"v");
 
     // Wait past expiry. Server enforces TTL with 1-s precision; pad generously.
@@ -1612,8 +1640,10 @@ async fn test_kv_watch_all_with_history() {
     let first = watcher.next().await.unwrap();
     let second = watcher.next().await.unwrap();
 
-    let got_a = (first.key == "a" && first.value == b"3") || (second.key == "a" && second.value == b"3");
-    let got_b = (first.key == "b" && first.value == b"2") || (second.key == "b" && second.value == b"2");
+    let got_a =
+        (first.key == "a" && first.value == b"3") || (second.key == "a" && second.value == b"3");
+    let got_b =
+        (first.key == "b" && first.value == b"2") || (second.key == "b" && second.value == b"2");
     assert!(got_a, "expected latest snapshot value for key a");
     assert!(got_b, "expected latest snapshot value for key b");
 
@@ -1700,8 +1730,10 @@ async fn test_kv_watch_many_with_history() {
     let first = watcher.next().await.unwrap();
     let second = watcher.next().await.unwrap();
 
-    let got_a = (first.key == "a" && first.value == b"3") || (second.key == "a" && second.value == b"3");
-    let got_b = (first.key == "b" && first.value == b"2") || (second.key == "b" && second.value == b"2");
+    let got_a =
+        (first.key == "a" && first.value == b"3") || (second.key == "a" && second.value == b"3");
+    let got_b =
+        (first.key == "b" && first.value == b"2") || (second.key == "b" && second.value == b"2");
     assert!(got_a, "expected latest snapshot value for key a");
     assert!(got_b, "expected latest snapshot value for key b");
 
@@ -1743,13 +1775,20 @@ async fn test_kv_entry_tombstone() {
     assert!(got.is_none(), "get() should hide tombstones");
 
     // entry() should return the tombstone.
-    let e = kv.entry("k").await.unwrap().expect("entry() must return tombstone");
+    let e = kv
+        .entry("k")
+        .await
+        .unwrap()
+        .expect("entry() must return tombstone");
     assert_eq!(e.key, "k");
     assert_eq!(e.operation, Operation::Delete);
 
     // entry() for a never-existing key returns None.
     let missing = kv.entry("nonexistent").await.unwrap();
-    assert!(missing.is_none(), "entry() for missing key should return None");
+    assert!(
+        missing.is_none(),
+        "entry() for missing key should return None"
+    );
 
     js.delete_stream("KV_entry_tomb").await.unwrap();
 }
@@ -1893,7 +1932,10 @@ async fn test_jetstream_purge_subject() {
     js.publish("purgesub.a", b"a2").await.unwrap();
     js.publish("purgesub.b", b"b1").await.unwrap();
 
-    let purge = js.purge_stream_subject("PURGESUB", "purgesub.a").await.unwrap();
+    let purge = js
+        .purge_stream_subject("PURGESUB", "purgesub.a")
+        .await
+        .unwrap();
     assert!(purge.success);
     assert_eq!(purge.purged, 2);
 
@@ -1929,7 +1971,10 @@ async fn test_jetstream_max_msgs_per_subject() {
     }
 
     let info = js.stream_info("MAXSUBJ").await.unwrap();
-    assert_eq!(info.state.messages, 2, "max_msgs_per_subject=2 should cap retention");
+    assert_eq!(
+        info.state.messages, 2,
+        "max_msgs_per_subject=2 should cap retention"
+    );
     assert_eq!(info.config.max_msgs_per_subject, 2);
 
     js.delete_stream("MAXSUBJ").await.unwrap();
@@ -1968,10 +2013,9 @@ async fn test_object_store_digest_mismatch() {
     js.publish(&chunk_subject, b"tampered").await.unwrap();
 
     // Wipe the original chunk(s) so reassembly picks up the tampered one.
-    let _ = js.purge_stream_subject(
-        "OBJ_digest",
-        &format!("$O.digest.C.{}", info.nuid),
-    ).await;
+    let _ = js
+        .purge_stream_subject("OBJ_digest", &format!("$O.digest.C.{}", info.nuid))
+        .await;
     // Republish a single corrupted chunk under the same subject.
     js.publish(&chunk_subject, b"tampered").await.unwrap();
 
@@ -2016,7 +2060,10 @@ async fn connect_tls() -> Client {
 async fn test_tls_connect() {
     let client = connect_tls().await;
     let info = client.server_info();
-    assert!(!info.server_id.is_empty(), "should get server info over TLS");
+    assert!(
+        !info.server_id.is_empty(),
+        "should get server info over TLS"
+    );
     assert!(info.tls_required, "TLS server should report tls_required");
 }
 
@@ -2148,19 +2195,18 @@ async fn test_connect_dns_hostname() {
 
 #[cfg(feature = "service")]
 async fn test_microservice_discovery() {
-    use nats_wasip3::{Service, ServiceConfig, EndpointConfig, PingResponse, InfoResponse, StatsResponse};
+    use nats_wasip3::{
+        EndpointConfig, InfoResponse, PingResponse, Service, ServiceConfig, StatsResponse,
+    };
 
     let client = connect().await;
-    let config = ServiceConfig::new("calc-svc", "1.2.3")
-        .description("Calculator Service");
-    let mut service = Service::add(client.clone(), config)
+    let config = ServiceConfig::new("calc-svc", "1.2.3").description("Calculator Service");
+    let mut service = Service::add(client.clone(), config).await.unwrap();
+
+    let sub = service
+        .add_endpoint(EndpointConfig::new("add").subject("calc.add"))
         .await
         .unwrap();
-
-    let sub = service.add_endpoint(
-        EndpointConfig::new("add")
-            .subject("calc.add")
-    ).await.unwrap();
 
     // Handle requests in background
     let _handler = wit_bindgen::spawn(async move {
@@ -2172,13 +2218,19 @@ async fn test_microservice_discovery() {
     });
 
     // PING discovery
-    let ping_msg = client.request("$SRV.PING.calc-svc", b"", secs(2)).await.unwrap();
+    let ping_msg = client
+        .request("$SRV.PING.calc-svc", b"", secs(2))
+        .await
+        .unwrap();
     let ping: PingResponse = serde_json::from_slice(&ping_msg.payload).unwrap();
     assert_eq!(ping.name, "calc-svc");
     assert_eq!(ping.version, "1.2.3");
 
     // INFO discovery
-    let info_msg = client.request("$SRV.INFO.calc-svc", b"", secs(2)).await.unwrap();
+    let info_msg = client
+        .request("$SRV.INFO.calc-svc", b"", secs(2))
+        .await
+        .unwrap();
     let info: InfoResponse = serde_json::from_slice(&info_msg.payload).unwrap();
     assert_eq!(info.endpoints.len(), 1);
     assert_eq!(info.endpoints[0].name, "add");
@@ -2190,7 +2242,10 @@ async fn test_microservice_discovery() {
     assert_eq!(result, 42);
 
     // STATS discovery
-    let stats_msg = client.request("$SRV.STATS.calc-svc", b"", secs(2)).await.unwrap();
+    let stats_msg = client
+        .request("$SRV.STATS.calc-svc", b"", secs(2))
+        .await
+        .unwrap();
     let stats: StatsResponse = serde_json::from_slice(&stats_msg.payload).unwrap();
     assert_eq!(stats.endpoints.len(), 1);
     assert_eq!(stats.endpoints[0].num_requests, 1);
@@ -2212,18 +2267,28 @@ async fn test_jetstream_direct_get() {
         subjects: vec!["direct.>".into()],
         allow_direct: true,
         ..Default::default()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     js.publish("direct.item.a", b"alpha").await.unwrap();
     js.publish("direct.item.b", b"beta").await.unwrap();
 
     // Direct get last for subject
-    let msg_a = js.direct_get_last_for_subject("DIRECT_GET_TEST", "direct.item.a").await.unwrap().expect("msg a exists");
+    let msg_a = js
+        .direct_get_last_for_subject("DIRECT_GET_TEST", "direct.item.a")
+        .await
+        .unwrap()
+        .expect("msg a exists");
     assert_eq!(msg_a.subject, "direct.item.a");
     assert_eq!(msg_a.payload, b"alpha");
 
     // Direct get by sequence
-    let msg_1 = js.direct_get("DIRECT_GET_TEST", 1).await.unwrap().expect("msg 1 exists");
+    let msg_1 = js
+        .direct_get("DIRECT_GET_TEST", 1)
+        .await
+        .unwrap()
+        .expect("msg 1 exists");
     assert_eq!(msg_1.sequence, 1);
     assert_eq!(msg_1.payload, b"alpha");
 
@@ -2232,7 +2297,7 @@ async fn test_jetstream_direct_get() {
 
 #[cfg(feature = "jetstream")]
 async fn test_jetstream_ordered_consumer() {
-    use nats_wasip3::jetstream::{JetStream, StreamConfig, OrderedConsumerConfig};
+    use nats_wasip3::jetstream::{JetStream, OrderedConsumerConfig, StreamConfig};
 
     let client = connect().await;
     let js = JetStream::new(client);
@@ -2242,16 +2307,26 @@ async fn test_jetstream_ordered_consumer() {
         name: "ORDERED_TEST".into(),
         subjects: vec!["ordered.>".into()],
         ..Default::default()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     for i in 1..=5 {
-        js.publish("ordered.msg", format!("val-{i}").as_bytes()).await.unwrap();
+        js.publish("ordered.msg", format!("val-{i}").as_bytes())
+            .await
+            .unwrap();
     }
 
-    let mut consumer = js.ordered_consumer("ORDERED_TEST", OrderedConsumerConfig {
-        filter_subject: Some("ordered.msg".into()),
-        ..Default::default()
-    }).await.unwrap();
+    let mut consumer = js
+        .ordered_consumer(
+            "ORDERED_TEST",
+            OrderedConsumerConfig {
+                filter_subject: Some("ordered.msg".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     for i in 1..=5 {
         let msg = consumer.next().await.unwrap();
@@ -2270,10 +2345,15 @@ async fn test_kv_keys_matching() {
     let js = JetStream::new(client);
 
     let _ = js.delete_stream("KV_match_test").await;
-    let kv = KeyValue::new(js.clone(), KvConfig {
-        bucket: "match_test".into(),
-        ..Default::default()
-    }).await.unwrap();
+    let kv = KeyValue::new(
+        js.clone(),
+        KvConfig {
+            bucket: "match_test".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     kv.put("cfg.app.host", b"localhost").await.unwrap();
     kv.put("cfg.app.port", b"8080").await.unwrap();
@@ -2295,15 +2375,24 @@ async fn test_object_store_seal_and_link() {
     let js = JetStream::new(client);
 
     let _ = js.delete_stream("OBJ_seal_test").await;
-    let store = ObjectStore::new(js.clone(), ObjectStoreConfig {
-        bucket: "seal_test".into(),
-        ..Default::default()
-    }).await.unwrap();
+    let store = ObjectStore::new(
+        js.clone(),
+        ObjectStoreConfig {
+            bucket: "seal_test".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     store.put("orig.txt", b"secret").await.unwrap();
     store.link("symlink.txt", "orig.txt").await.unwrap();
 
-    let obj = store.get("symlink.txt").await.unwrap().expect("link exists");
+    let obj = store
+        .get("symlink.txt")
+        .await
+        .unwrap()
+        .expect("link exists");
     assert!(obj.info.link.is_some());
 
     store.seal().await.unwrap();
@@ -2343,45 +2432,123 @@ async fn run_tests() {
     // ── Core client ────────────────────────────────────────────
     run_test!("test_publish_subscribe", test_publish_subscribe().await);
     run_test!("test_subscribe_wildcard", test_subscribe_wildcard().await);
-    run_test!("test_subscribe_full_wildcard", test_subscribe_full_wildcard().await);
-    run_test!("test_publish_with_headers", test_publish_with_headers().await);
+    run_test!(
+        "test_subscribe_full_wildcard",
+        test_subscribe_full_wildcard().await
+    );
+    run_test!(
+        "test_publish_with_headers",
+        test_publish_with_headers().await
+    );
     run_test!("test_publish_with_reply", test_publish_with_reply().await);
     run_test!("test_server_info", test_server_info().await);
-    run_test!("test_subscribe_queue_group", test_subscribe_queue_group().await);
+    run_test!(
+        "test_subscribe_queue_group",
+        test_subscribe_queue_group().await
+    );
     run_test!("test_request_reply", test_request_reply().await);
-    run_test!("test_request_with_headers", test_request_with_headers().await);
-    run_test!("test_request_no_responders", test_request_no_responders().await);
-    run_test!("test_multiple_subscriptions", test_multiple_subscriptions().await);
+    run_test!(
+        "test_request_with_headers",
+        test_request_with_headers().await
+    );
+    run_test!(
+        "test_request_no_responders",
+        test_request_no_responders().await
+    );
+    run_test!(
+        "test_multiple_subscriptions",
+        test_multiple_subscriptions().await
+    );
     run_test!("test_unsubscribe_on_drop", test_unsubscribe_on_drop().await);
     run_test!("test_large_payload", test_large_payload().await);
-    run_test!("test_publish_empty_payload", test_publish_empty_payload().await);
+    run_test!(
+        "test_publish_empty_payload",
+        test_publish_empty_payload().await
+    );
     run_test!("test_request_timeout", test_request_timeout().await);
-    run_test!("test_subscribe_unsubscribe_resubscribe", test_subscribe_unsubscribe_resubscribe().await);
-    run_test!("test_multiple_header_values", test_multiple_header_values().await);
-    run_test!("test_queue_group_distribution", test_queue_group_distribution().await);
-    run_test!("test_concurrent_subscriptions_same_subject", test_concurrent_subscriptions_same_subject().await);
-    run_test!("test_publish_max_payload_boundary", test_publish_max_payload_boundary().await);
-    run_test!("test_connect_dns_hostname", test_connect_dns_hostname().await);
+    run_test!(
+        "test_subscribe_unsubscribe_resubscribe",
+        test_subscribe_unsubscribe_resubscribe().await
+    );
+    run_test!(
+        "test_multiple_header_values",
+        test_multiple_header_values().await
+    );
+    run_test!(
+        "test_queue_group_distribution",
+        test_queue_group_distribution().await
+    );
+    run_test!(
+        "test_concurrent_subscriptions_same_subject",
+        test_concurrent_subscriptions_same_subject().await
+    );
+    run_test!(
+        "test_publish_max_payload_boundary",
+        test_publish_max_payload_boundary().await
+    );
+    run_test!(
+        "test_connect_dns_hostname",
+        test_connect_dns_hostname().await
+    );
     run_test!("test_client_flush", test_client_flush().await);
-    run_test!("test_subscription_explicit_unsubscribe", test_subscription_explicit_unsubscribe().await);
-    run_test!("test_subscription_unsubscribe_after", test_subscription_unsubscribe_after().await);
+    run_test!(
+        "test_subscription_explicit_unsubscribe",
+        test_subscription_explicit_unsubscribe().await
+    );
+    run_test!(
+        "test_subscription_unsubscribe_after",
+        test_subscription_unsubscribe_after().await
+    );
 
     // ── JetStream ──────────────────────────────────────────────
     #[cfg(feature = "jetstream")]
     {
         run_test!("test_jetstream_publish", test_jetstream_publish().await);
-        run_test!("test_jetstream_purge_stream", test_jetstream_purge_stream().await);
-        run_test!("test_jetstream_consumer_crud", test_jetstream_consumer_crud().await);
-        run_test!("test_jetstream_stream_get_msg", test_jetstream_stream_get_msg().await);
-        run_test!("test_jetstream_publish_with_headers", test_jetstream_publish_with_headers().await);
+        run_test!(
+            "test_jetstream_purge_stream",
+            test_jetstream_purge_stream().await
+        );
+        run_test!(
+            "test_jetstream_consumer_crud",
+            test_jetstream_consumer_crud().await
+        );
+        run_test!(
+            "test_jetstream_stream_get_msg",
+            test_jetstream_stream_get_msg().await
+        );
+        run_test!(
+            "test_jetstream_publish_with_headers",
+            test_jetstream_publish_with_headers().await
+        );
         run_test!("test_push_consumer", test_push_consumer().await);
-        run_test!("test_jetstream_fetch_empty_stream", test_jetstream_fetch_empty_stream().await);
-        run_test!("test_jetstream_publish_dedup", test_jetstream_publish_dedup().await);
-        run_test!("test_jetstream_stream_info_not_found", test_jetstream_stream_info_not_found().await);
-        run_test!("test_jetstream_purge_subject", test_jetstream_purge_subject().await);
-        run_test!("test_jetstream_max_msgs_per_subject", test_jetstream_max_msgs_per_subject().await);
-        run_test!("test_jetstream_direct_get", test_jetstream_direct_get().await);
-        run_test!("test_jetstream_ordered_consumer", test_jetstream_ordered_consumer().await);
+        run_test!(
+            "test_jetstream_fetch_empty_stream",
+            test_jetstream_fetch_empty_stream().await
+        );
+        run_test!(
+            "test_jetstream_publish_dedup",
+            test_jetstream_publish_dedup().await
+        );
+        run_test!(
+            "test_jetstream_stream_info_not_found",
+            test_jetstream_stream_info_not_found().await
+        );
+        run_test!(
+            "test_jetstream_purge_subject",
+            test_jetstream_purge_subject().await
+        );
+        run_test!(
+            "test_jetstream_max_msgs_per_subject",
+            test_jetstream_max_msgs_per_subject().await
+        );
+        run_test!(
+            "test_jetstream_direct_get",
+            test_jetstream_direct_get().await
+        );
+        run_test!(
+            "test_jetstream_ordered_consumer",
+            test_jetstream_ordered_consumer().await
+        );
     }
 
     // ── KV ─────────────────────────────────────────────────────
@@ -2389,19 +2556,40 @@ async fn run_tests() {
     {
         run_test!("test_kv_put_get", test_kv_put_get().await);
         run_test!("test_kv_purge_key", test_kv_purge_key().await);
-        run_test!("test_kv_keys_and_load_all", test_kv_keys_and_load_all().await);
+        run_test!(
+            "test_kv_keys_and_load_all",
+            test_kv_keys_and_load_all().await
+        );
         run_test!("test_kv_get_nonexistent", test_kv_get_nonexistent().await);
         run_test!("test_kv_open_existing", test_kv_open_existing().await);
         run_test!("test_kv_watch", test_kv_watch().await);
-        run_test!("test_kv_update_wrong_revision", test_kv_update_wrong_revision().await);
+        run_test!(
+            "test_kv_update_wrong_revision",
+            test_kv_update_wrong_revision().await
+        );
         run_test!("test_kv_put_overwrite", test_kv_put_overwrite().await);
-        run_test!("test_kv_delete_then_create", test_kv_delete_then_create().await);
+        run_test!(
+            "test_kv_delete_then_create",
+            test_kv_delete_then_create().await
+        );
         run_test!("test_kv_status", test_kv_status().await);
         run_test!("test_kv_watch_from_seq", test_kv_watch_from_seq().await);
-        run_test!("test_kv_watch_all_new_only", test_kv_watch_all_new_only().await);
-        run_test!("test_kv_watch_all_with_history", test_kv_watch_all_with_history().await);
-        run_test!("test_kv_watch_many_new_only", test_kv_watch_many_new_only().await);
-        run_test!("test_kv_watch_many_with_history", test_kv_watch_many_with_history().await);
+        run_test!(
+            "test_kv_watch_all_new_only",
+            test_kv_watch_all_new_only().await
+        );
+        run_test!(
+            "test_kv_watch_all_with_history",
+            test_kv_watch_all_with_history().await
+        );
+        run_test!(
+            "test_kv_watch_many_new_only",
+            test_kv_watch_many_new_only().await
+        );
+        run_test!(
+            "test_kv_watch_many_with_history",
+            test_kv_watch_many_with_history().await
+        );
         run_test!("test_kv_entry_tombstone", test_kv_entry_tombstone().await);
         run_test!("test_kv_history", test_kv_history().await);
         run_test!("test_kv_watch_single_key", test_kv_watch_single_key().await);
@@ -2413,22 +2601,43 @@ async fn run_tests() {
     // ── Object Store ───────────────────────────────────────────
     #[cfg(feature = "jetstream")]
     {
-        run_test!("test_object_store_put_get", test_object_store_put_get().await);
+        run_test!(
+            "test_object_store_put_get",
+            test_object_store_put_get().await
+        );
         run_test!("test_object_store_list", test_object_store_list().await);
         run_test!("test_object_store_delete", test_object_store_delete().await);
-        run_test!("test_object_store_overwrite", test_object_store_overwrite().await);
-        run_test!("test_object_store_large_object", test_object_store_large_object().await);
+        run_test!(
+            "test_object_store_overwrite",
+            test_object_store_overwrite().await
+        );
+        run_test!(
+            "test_object_store_large_object",
+            test_object_store_large_object().await
+        );
         run_test!("test_object_store_info", test_object_store_info().await);
         run_test!("test_object_store_status", test_object_store_status().await);
-        run_test!("test_object_store_open_existing", test_object_store_open_existing().await);
-        run_test!("test_object_store_digest_mismatch", test_object_store_digest_mismatch().await);
-        run_test!("test_object_store_seal_and_link", test_object_store_seal_and_link().await);
+        run_test!(
+            "test_object_store_open_existing",
+            test_object_store_open_existing().await
+        );
+        run_test!(
+            "test_object_store_digest_mismatch",
+            test_object_store_digest_mismatch().await
+        );
+        run_test!(
+            "test_object_store_seal_and_link",
+            test_object_store_seal_and_link().await
+        );
     }
 
     // ── Microservices (ADR-32) ─────────────────────────────────
     #[cfg(feature = "service")]
     {
-        run_test!("test_microservice_discovery", test_microservice_discovery().await);
+        run_test!(
+            "test_microservice_discovery",
+            test_microservice_discovery().await
+        );
     }
 
     // ── TLS ────────────────────────────────────────────────────
@@ -2440,8 +2649,8 @@ async fn run_tests() {
         //   nats-server -js -p 4223 \
         //     --tls --tlscert testdata/server-cert.pem \
         //     --tlskey testdata/server-key.pem
-        let run_tls = std::env::var("NATS_TLS_URL").is_ok()
-            || std::env::var("RUN_TLS_TESTS").is_ok();
+        let run_tls =
+            std::env::var("NATS_TLS_URL").is_ok() || std::env::var("RUN_TLS_TESTS").is_ok();
         if run_tls {
             println!("\n--- TLS tests ---");
 
@@ -2450,10 +2659,22 @@ async fn run_tests() {
             // Reuse a single TLS connection for the remaining tests.
             let tls_client = connect_tls().await;
 
-            run_test!("test_tls_publish_subscribe", test_tls_publish_subscribe(&tls_client).await);
-            run_test!("test_tls_request_reply", test_tls_request_reply(&tls_client).await);
-            run_test!("test_tls_large_payload", test_tls_large_payload(&tls_client).await);
-            run_test!("test_tls_with_headers", test_tls_with_headers(&tls_client).await);
+            run_test!(
+                "test_tls_publish_subscribe",
+                test_tls_publish_subscribe(&tls_client).await
+            );
+            run_test!(
+                "test_tls_request_reply",
+                test_tls_request_reply(&tls_client).await
+            );
+            run_test!(
+                "test_tls_large_payload",
+                test_tls_large_payload(&tls_client).await
+            );
+            run_test!(
+                "test_tls_with_headers",
+                test_tls_with_headers(&tls_client).await
+            );
 
             #[cfg(feature = "jetstream")]
             {

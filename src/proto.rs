@@ -83,15 +83,35 @@ impl Headers {
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
         let key = key.into();
         let value = value.into();
-        // Sanitise: remove any CR or LF characters to prevent header injection.
-        // NATS header keys must not be empty or contain control characters;
-        // values follow the same rule. We strip rather than error so that
-        // internal callers (schedule, kv, jetstream) stay infallible.
-        let key = key.replace(['\r', '\n'], "");
-        let value = value.replace(['\r', '\n'], "");
+        // Sanitise: remove CR, LF, null byte, and colons in key to prevent header smuggling.
+        let key = key.replace(['\r', '\n', '\0', ':'], "");
+        let value = value.replace(['\r', '\n', '\0'], "");
         if !key.is_empty() {
             self.entries.push((key, value));
         }
+    }
+
+    /// Try inserting a header key-value pair, returning an error if key or value contains
+    /// control characters (`\r`, `\n`, `\0`) or if key contains `:`.
+    pub fn try_insert(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), crate::Error> {
+        let key = key.into();
+        let value = value.into();
+        if key.is_empty() || key.contains(['\r', '\n', '\0', ':']) {
+            return Err(crate::Error::Protocol(format!(
+                "invalid header key: {key:?}"
+            )));
+        }
+        if value.contains(['\r', '\n', '\0']) {
+            return Err(crate::Error::Protocol(format!(
+                "invalid header value: {value:?}"
+            )));
+        }
+        self.entries.push((key, value));
+        Ok(())
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -295,6 +315,27 @@ fn validate_subject(subject: &str) -> Result<(), crate::Error> {
     {
         return Err(crate::Error::Protocol(format!(
             "subject contains illegal character: {subject:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a NATS bucket name (for KV or Object Store).
+///
+/// Bucket names must not be empty and can only contain alphanumeric characters,
+/// dashes `-`, and underscores `_`. Dots, spaces, and wildcards are disallowed.
+pub(crate) fn validate_bucket_name(bucket: &str) -> Result<(), crate::Error> {
+    if bucket.is_empty() {
+        return Err(crate::Error::Protocol(
+            "bucket name must not be empty".into(),
+        ));
+    }
+    if !bucket
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(crate::Error::Protocol(format!(
+            "invalid bucket name '{bucket}': must contain only alphanumeric characters, dashes, and underscores"
         )));
     }
     Ok(())
@@ -943,5 +984,39 @@ mod tests {
             }
             _ => panic!("expected Msg"),
         }
+    }
+
+    #[test]
+    fn validate_bucket_name_valid() {
+        assert!(validate_bucket_name("my-bucket").is_ok());
+        assert!(validate_bucket_name("bucket_123").is_ok());
+        assert!(validate_bucket_name("TEST").is_ok());
+    }
+
+    #[test]
+    fn validate_bucket_name_invalid() {
+        assert!(validate_bucket_name("").is_err());
+        assert!(validate_bucket_name("bucket.with.dots").is_err());
+        assert!(validate_bucket_name("bucket with space").is_err());
+        assert!(validate_bucket_name("bucket*wildcard").is_err());
+        assert!(validate_bucket_name("bucket>wildcard").is_err());
+    }
+
+    #[test]
+    fn headers_insert_sanitizes_colons_and_control_chars() {
+        let mut h = Headers::new();
+        h.insert("Key:With:Colon\r\n\0", "Value\r\nWith\0Control");
+        assert_eq!(h.get("KeyWithColon"), Some("ValueWithControl"));
+    }
+
+    #[test]
+    fn headers_try_insert_rejects_malicious_inputs() {
+        let mut h = Headers::new();
+        assert!(h.try_insert("Valid-Key", "Valid-Value").is_ok());
+        assert!(h.try_insert("Key:Colon", "Value").is_err());
+        assert!(h.try_insert("Key\r\nInjection", "Value").is_err());
+        assert!(h.try_insert("Key", "Value\r\nInjection").is_err());
+        assert!(h.try_insert("Key\0Null", "Value").is_err());
+        assert!(h.try_insert("Key", "Value\0Null").is_err());
     }
 }

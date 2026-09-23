@@ -256,7 +256,7 @@ impl JetStream {
                 }
             }
 
-            let is_last = msg.headers.as_ref().map_or(false, |h| {
+            let is_last = msg.headers.as_ref().is_some_and(|h| {
                 h.get("Nats-Pending-Messages")
                     .or_else(|| h.get("Nats-Pending"))
                     .or_else(|| h.get("Nats-Num-Pending"))
@@ -391,11 +391,7 @@ impl JetStream {
 
     /// Get a message by stream sequence number directly using `$JS.API.DIRECT.GET.<stream>`.
     /// Requires `allow_direct: true` on the stream.
-    pub async fn direct_get(
-        &self,
-        stream: &str,
-        seq: u64,
-    ) -> Result<Option<DirectMessage>, Error> {
+    pub async fn direct_get(&self, stream: &str, seq: u64) -> Result<Option<DirectMessage>, Error> {
         #[derive(Serialize)]
         struct DirectReq {
             seq: u64,
@@ -467,21 +463,10 @@ impl JetStream {
         stream: &str,
         config: &ConsumerConfig,
     ) -> Result<ConsumerMessages, Error> {
-        // Generate a unique deliver subject if not provided.
+        // Generate a cryptographically random unique deliver subject if not provided.
         let deliver = match &config.deliver_subject {
             Some(d) => d.clone(),
-            None => {
-                use std::cell::Cell;
-                thread_local! {
-                    static CTR: Cell<u64> = const { Cell::new(0) };
-                }
-                let id = CTR.with(|c| {
-                    let v = c.get();
-                    c.set(v + 1);
-                    v
-                });
-                format!("_DELIVER.{stream}.{id}")
-            }
+            None => self.client.new_inbox(),
         };
 
         let mut cfg = config.clone();
@@ -1028,8 +1013,8 @@ impl MsgMetadata {
     pub fn parse(reply: &str) -> Option<Self> {
         let tokens: Vec<&str> = reply.split('.').collect();
         match tokens.len() {
-            // v1: $JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>
-            9 => {
+            // v1: $JS.ACK.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>[.<token>]
+            9 | 10 => {
                 if tokens[0] != "$JS" || tokens[1] != "ACK" {
                     return None;
                 }
@@ -1045,14 +1030,22 @@ impl MsgMetadata {
                     account: None,
                 })
             }
-            // v2: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>.<token>
-            12 => {
+            // v2: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<stream_seq>.<consumer_seq>.<ts_nanos>.<pending>[.<token>]
+            11 | 12 => {
                 if tokens[0] != "$JS" || tokens[1] != "ACK" {
                     return None;
                 }
                 Some(MsgMetadata {
-                    domain: if tokens[2].is_empty() { None } else { Some(tokens[2].to_string()) },
-                    account: if tokens[3].is_empty() { None } else { Some(tokens[3].to_string()) },
+                    domain: if tokens[2].is_empty() {
+                        None
+                    } else {
+                        Some(tokens[2].to_string())
+                    },
+                    account: if tokens[3].is_empty() {
+                        None
+                    } else {
+                        Some(tokens[3].to_string())
+                    },
                     stream: tokens[4].to_string(),
                     consumer: tokens[5].to_string(),
                     num_delivered: tokens[6].parse().ok()?,
@@ -1156,7 +1149,9 @@ impl OrderedConsumer {
             // Extract metadata from reply-to subject
             if let Some(ref reply) = msg.reply_to {
                 if let Some(meta) = MsgMetadata::parse(reply) {
-                    if self.last_consumer_seq > 0 && meta.consumer_sequence != self.last_consumer_seq + 1 {
+                    if self.last_consumer_seq > 0
+                        && meta.consumer_sequence != self.last_consumer_seq + 1
+                    {
                         // Gap detected in consumer sequence! Reset consumer.
                         self.reset_consumer().await?;
                         continue;
@@ -1171,10 +1166,16 @@ impl OrderedConsumer {
     }
 
     async fn reset_consumer(&mut self) -> Result<(), Error> {
-        let _ = self.sub.unsubscribe();
-        let delete_subject = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream, self.consumer_name);
+        self.sub.unsubscribe();
+        let delete_subject = format!(
+            "$JS.API.CONSUMER.DELETE.{}.{}",
+            self.stream, self.consumer_name
+        );
         let inbox = self.js.client.new_inbox();
-        let _ = self.js.client.publish_with_reply(&delete_subject, &inbox, b"");
+        let _ = self
+            .js
+            .client
+            .publish_with_reply(&delete_subject, &inbox, b"");
 
         self.deliver_subject = self.js.client.new_inbox();
         self.sub = self.js.client.subscribe(&self.deliver_subject)?;
@@ -1211,8 +1212,11 @@ impl OrderedConsumer {
 
 impl Drop for OrderedConsumer {
     fn drop(&mut self) {
-        let _ = self.sub.unsubscribe();
-        let subject = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream, self.consumer_name);
+        self.sub.unsubscribe();
+        let subject = format!(
+            "$JS.API.CONSUMER.DELETE.{}.{}",
+            self.stream, self.consumer_name
+        );
         let inbox = self.js.client.new_inbox();
         let _ = self.js.client.publish_with_reply(&subject, &inbox, b"");
     }
@@ -1254,4 +1258,3 @@ mod tests {
         assert_eq!(meta.num_pending, 10);
     }
 }
-

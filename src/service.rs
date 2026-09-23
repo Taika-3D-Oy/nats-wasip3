@@ -266,6 +266,7 @@ pub struct Service {
     config: ServiceConfig,
     started_rfc3339: String,
     endpoints: Rc<RefCell<Vec<EndpointEntry>>>,
+    control_sids: Vec<String>,
 }
 
 impl Service {
@@ -285,6 +286,7 @@ impl Service {
 
         let endpoints = Rc::new(RefCell::new(Vec::new()));
         let mut control_subs = Vec::new();
+        let mut control_sids = Vec::new();
 
         // Subscribe to control verbs.
         let verbs = ["PING", "INFO", "STATS", "SCHEMA"];
@@ -296,6 +298,7 @@ impl Service {
             ];
             for subj in subjects {
                 let sub = client.subscribe(&subj)?;
+                control_sids.push(sub.sid().to_string());
                 control_subs.push(sub);
             }
         }
@@ -305,17 +308,11 @@ impl Service {
             config: config.clone(),
             started_rfc3339: started_rfc3339.clone(),
             endpoints: Rc::clone(&endpoints),
+            control_sids,
         };
 
         // Spawn background control handler subtasks.
-        spawn_control_handlers(
-            control_subs,
-            client,
-            config,
-            id,
-            started_rfc3339,
-            endpoints,
-        );
+        spawn_control_handlers(control_subs, client, config, id, started_rfc3339, endpoints);
 
         Ok(svc)
     }
@@ -357,8 +354,14 @@ impl Service {
     }
 
     /// Add a top-level endpoint to the service.
-    pub async fn add_endpoint(&self, config: EndpointConfig) -> Result<EndpointSubscription, Error> {
-        let subject = config.subject.clone().unwrap_or_else(|| config.name.clone());
+    pub async fn add_endpoint(
+        &self,
+        config: EndpointConfig,
+    ) -> Result<EndpointSubscription, Error> {
+        let subject = config
+            .subject
+            .clone()
+            .unwrap_or_else(|| config.name.clone());
         let queue_group = config
             .queue_group
             .clone()
@@ -482,9 +485,18 @@ impl Service {
         }
     }
 
-    /// Stop the service by clearing registered endpoints.
+    /// Stop the service by unregistering control handlers and clearing registered endpoints.
     pub fn stop(&mut self) {
         self.endpoints.borrow_mut().clear();
+        for sid in self.control_sids.drain(..) {
+            self.client.unsubscribe_sid(&sid);
+        }
+    }
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
