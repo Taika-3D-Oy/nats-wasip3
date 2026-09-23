@@ -175,7 +175,7 @@ async fn test_request_reply() {
     // Set up a responder.
     let sub = client.subscribe("test.echo").unwrap();
     let client2 = client.clone();
-    wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         let msg = sub.next().await.unwrap();
         let reply_to = msg.reply_to.as_ref().unwrap();
         client2.publish(reply_to, &msg.payload).unwrap();
@@ -190,7 +190,7 @@ async fn test_request_with_headers() {
 
     let sub = client.subscribe("test.echo.hdr").unwrap();
     let client2 = client.clone();
-    wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         let msg = sub.next().await.unwrap();
         let reply_to = msg.reply_to.as_ref().unwrap();
         // Echo back the payload and a custom header
@@ -2081,7 +2081,7 @@ async fn test_tls_publish_subscribe(client: &Client) {
 async fn test_tls_request_reply(client: &Client) {
     let sub = client.subscribe("tls.echo").unwrap();
     let client2 = client.clone();
-    wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         let msg = sub.next().await.unwrap();
         let reply_to = msg.reply_to.as_ref().unwrap();
         client2.publish(reply_to, &msg.payload).unwrap();
@@ -2209,7 +2209,7 @@ async fn test_microservice_discovery() {
         .unwrap();
 
     // Handle requests in background
-    let _handler = wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         while let Ok(req) = sub.next().await {
             let num: i64 = serde_json::from_slice(&req.message.payload).unwrap_or(0);
             let resp_bytes = serde_json::to_vec(&(num + 10)).unwrap();

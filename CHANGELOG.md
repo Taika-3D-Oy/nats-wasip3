@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0-rc.1] – 2026-09-23
+
+### Added
+
+- **WASI 0.3 Stable Runtime**:
+  - Upgraded to `wasip3 = "0.9.0+wasi-0.3.0"` and `wit-bindgen = "0.62.0"`.
+  - Migrated background task concurrency from legacy `wit_bindgen::spawn` to `wit_bindgen::spawn_local` across client, TLS, and service modules.
+- **Graceful Draining**:
+  - `Subscription::drain(&self)`: sends `UNSUB <sid>` to server, stops accepting new messages, and yields remaining buffered messages before closing with `Error::Disconnected`.
+  - `Client::drain(&self, timeout: Duration)`: marks client as draining, unsubscribes all active subscriptions, flushes outbound writes, waits for all mailboxes to empty, and cleanly closes the connection.
+  - Rejection of new `publish`, `subscribe`, and `request` calls while the client is draining.
+- **Connection Lifecycle Events**:
+  - `Event` enum: `Connected`, `Disconnected`, `Reconnected(String)`, `SlowConsumerDropped { sid, subject }`, and `ServerError(String)`.
+  - `Client::events(&self) -> Events`: asynchronous multi-listener stream for connection health, reconnects, server error frames, and slow consumer message drop notifications.
+- **JetStream Stream & Consumer Discovery**:
+  - `JetStream::stream_names` and `JetStream::stream_names_filtered`: list stream names with optional subject filters.
+  - `JetStream::list_streams` and `JetStream::list_streams_filtered`: list streams with detailed configurations and states.
+  - `JetStream::consumer_names`: list consumer names on a stream.
+  - `JetStream::list_consumers`: list consumers with detailed configurations and metrics on a stream.
+  - Automatic offset-based pagination accumulation across stream and consumer discovery endpoints.
+- **Model Ergonomics & Re-exports**:
+  - Re-exported `Event`, `Events`, `JetStream`, `StreamInfo`, `StreamConfig`, `StreamState`, `ConsumerInfo`, and `ConsumerConfig` at crate root `nats_wasip3`.
+  - Derived `Clone` and `Serialize` on `StreamInfo`, `StreamState`, and `ConsumerInfo`.
+- **Unit & Packaging Tests**:
+  - Added unit tests for subscription draining, lifecycle event dispatch, slow consumer drop notifications, and discovery response deserialization.
+  - Cleaned compiler lints for non-TLS builds (`extract_server_name` gated under `#[cfg(any(feature = "tls", test))]`).
+
 ## [0.13.0] – 2026-09-23
 
 ### Security

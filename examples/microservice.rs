@@ -46,14 +46,14 @@ async fn run() -> Result<(), nats_wasip3::Error> {
     let add_ep = v1.add_endpoint(EndpointConfig::new("add")).await?;
 
     // Handle requests on echo endpoint in background
-    let echo_handle = wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         while let Ok(req) = echo_ep.next().await {
             let _ = req.respond(req.payload());
         }
     });
 
     // Handle requests on add endpoint in background
-    let add_handle = wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         while let Ok(req) = add_ep.next().await {
             let input = String::from_utf8_lossy(req.payload());
             let nums: Vec<i64> = input
@@ -91,7 +91,5 @@ async fn run() -> Result<(), nats_wasip3::Error> {
         String::from_utf8_lossy(&stats.payload)
     );
 
-    let _ = echo_handle;
-    let _ = add_handle;
     Ok(())
 }

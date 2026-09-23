@@ -37,6 +37,80 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// Connection lifecycle and operational events.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// The client is connected to a NATS server.
+    Connected,
+    /// The connection to the NATS server was lost.
+    Disconnected,
+    /// The client successfully reconnected to the server at the given address.
+    Reconnected(String),
+    /// A subscription fell behind its mailbox capacity and the oldest message was dropped.
+    SlowConsumerDropped {
+        /// Subscription ID (SID) that dropped the message.
+        sid: String,
+        /// Subject of the dropped message.
+        subject: String,
+    },
+    /// A server-side error (`-ERR`) was received.
+    ServerError(String),
+}
+
+/// An asynchronous stream of connection lifecycle events.
+pub struct Events {
+    listener_id: u64,
+    inner: Rc<RefCell<Inner>>,
+}
+
+impl Events {
+    /// Receive the next connection lifecycle event.
+    /// Returns `None` if the client has been closed and all events have been consumed.
+    pub async fn next(&mut self) -> Option<Event> {
+        NextEvent {
+            listener_id: self.listener_id,
+            inner: &self.inner,
+        }
+        .await
+    }
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        self.inner
+            .borrow_mut()
+            .event_listeners
+            .remove(&self.listener_id);
+    }
+}
+
+struct NextEvent<'a> {
+    listener_id: u64,
+    inner: &'a Rc<RefCell<Inner>>,
+}
+
+impl<'a> Future for NextEvent<'a> {
+    type Output = Option<Event>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.inner.borrow_mut();
+        let closed = inner.closed;
+        if let Some((queue, waker)) = inner.event_listeners.get_mut(&self.listener_id) {
+            if let Some(event) = queue.pop_front() {
+                return Poll::Ready(Some(event));
+            }
+            if closed {
+                return Poll::Ready(None);
+            }
+            *waker = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
 /// A subscription that yields messages.
 pub struct Subscription {
     sid: String,
@@ -79,6 +153,35 @@ impl Subscription {
         }
     }
 
+    /// Drain the subscription gracefully. Sends UNSUB to the server so no new
+    /// messages are sent to this subscription, but preserves already buffered
+    /// messages in the local queue. Once all buffered messages have been yielded by
+    /// [`next`](Self::next), subsequent calls return `Err(Error::Disconnected)`.
+    pub fn drain(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.subscriptions.remove(&self.sid);
+        let unsub = proto::encode_unsub(&self.sid, None);
+        inner.write_buf.extend_from_slice(&unsub);
+        if let Some(w) = inner.flush_waker.take() {
+            w.wake();
+        }
+        if let Some(mailbox) = inner.mailboxes.get_mut(&self.sid) {
+            mailbox.draining = true;
+            if mailbox.queue.is_empty() {
+                let waker = mailbox.waker.take();
+                inner.mailboxes.remove(&self.sid);
+                if let Some(w) = waker {
+                    w.wake();
+                }
+                if inner.draining && inner.mailboxes.values().all(|m| m.queue.is_empty()) {
+                    for w in std::mem::take(&mut inner.drain_wakers) {
+                        w.wake();
+                    }
+                }
+            }
+        }
+    }
+
     /// Ask the server to deliver at most `max_msgs` more messages, then
     /// automatically unsubscribe. Useful for request-after-subscribe patterns.
     pub fn unsubscribe_after(&self, max_msgs: u64) {
@@ -94,7 +197,7 @@ impl Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
-        // If unsubscribe() was called explicitly, mailbox is already gone.
+        // If unsubscribe() or drain() already cleaned up the mailbox, nothing more to do.
         let mailbox = inner.mailboxes.remove(&self.sid);
         if mailbox.is_none() {
             return;
@@ -107,6 +210,11 @@ impl Drop for Subscription {
         }
         if let Some(mb) = mailbox {
             if let Some(w) = mb.waker {
+                w.wake();
+            }
+        }
+        if inner.draining && inner.mailboxes.values().all(|m| m.queue.is_empty()) {
+            for w in std::mem::take(&mut inner.drain_wakers) {
                 w.wake();
             }
         }
@@ -210,6 +318,7 @@ struct SubInfo {
 struct Mailbox {
     queue: VecDeque<Message>,
     waker: Option<Waker>,
+    draining: bool,
 }
 
 struct RequestSlot {
@@ -250,6 +359,25 @@ struct Inner {
     write_buf_limit: usize,
     /// Server's advertised max_payload limit (0 = unlimited).
     max_payload: usize,
+    /// Whether the client is draining connections and subscriptions.
+    draining: bool,
+    /// Wakers waiting for all active mailboxes to be drained in `Client::drain`.
+    drain_wakers: Vec<Waker>,
+    /// Monotonically increasing listener ID for event subscriptions.
+    next_listener_id: u64,
+    /// Registered event stream listeners.
+    event_listeners: HashMap<u64, (VecDeque<Event>, Option<Waker>)>,
+}
+
+impl Inner {
+    fn emit_event(&mut self, event: Event) {
+        for (queue, waker) in self.event_listeners.values_mut() {
+            queue.push_back(event.clone());
+            if let Some(w) = waker.take() {
+                w.wake();
+            }
+        }
+    }
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -425,10 +553,14 @@ impl Client {
             mailbox_capacity: config.subscription_capacity,
             write_buf_limit: config.max_pending_write_bytes,
             max_payload: info.max_payload,
+            draining: false,
+            drain_wakers: Vec::new(),
+            next_listener_id: 1,
+            event_listeners: HashMap::new(),
         }));
 
         // Drain send future in background so it does not leak.
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             let _ = send_fut.await;
         });
 
@@ -436,7 +568,7 @@ impl Client {
         {
             let inner2 = Rc::clone(&inner);
             let config2 = config.clone();
-            wit_bindgen::spawn(async move {
+            wit_bindgen::spawn_local(async move {
                 read_loop(rx, rx_fut, inner2, buf, config2).await;
             });
         }
@@ -444,7 +576,7 @@ impl Client {
         // ── Spawn flush loop ───────────────────────────────────
         {
             let inner2 = Rc::clone(&inner);
-            wit_bindgen::spawn(async move {
+            wit_bindgen::spawn_local(async move {
                 flush_loop(inner2, tx).await;
             });
         }
@@ -463,7 +595,7 @@ impl Client {
 
     /// Publish a message.
     pub fn publish(&self, subject: &str, payload: &[u8]) -> Result<(), Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         self.check_payload_size(payload.len())?;
         let data = proto::encode_pub(subject, None, payload)?;
         self.enqueue_write(&data)?;
@@ -477,7 +609,7 @@ impl Client {
         reply_to: &str,
         payload: &[u8],
     ) -> Result<(), Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         self.check_payload_size(payload.len())?;
         let data = proto::encode_pub(subject, Some(reply_to), payload)?;
         self.enqueue_write(&data)?;
@@ -492,7 +624,7 @@ impl Client {
         headers: &Headers,
         payload: &[u8],
     ) -> Result<(), Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         self.check_payload_size(payload.len())?;
         let data = proto::encode_hpub(subject, reply_to, headers, payload)?;
         self.enqueue_write(&data)?;
@@ -501,7 +633,7 @@ impl Client {
 
     /// Subscribe to a subject.
     pub fn subscribe(&self, subject: &str) -> Result<Subscription, Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         let sid = self.next_sid();
         let data = proto::encode_sub(subject, &sid)?;
         self.enqueue_write(&data)?;
@@ -512,6 +644,7 @@ impl Client {
             Mailbox {
                 queue: VecDeque::new(),
                 waker: None,
+                draining: false,
             },
         );
         inner.subscriptions.insert(
@@ -530,7 +663,7 @@ impl Client {
 
     /// Subscribe with a queue group.
     pub fn subscribe_queue(&self, subject: &str, queue: &str) -> Result<Subscription, Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         let sid = self.next_sid();
         let data = proto::encode_sub_queue(subject, queue, &sid)?;
         self.enqueue_write(&data)?;
@@ -541,6 +674,7 @@ impl Client {
             Mailbox {
                 queue: VecDeque::new(),
                 waker: None,
+                draining: false,
             },
         );
         inner.subscriptions.insert(
@@ -564,7 +698,7 @@ impl Client {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<Message, Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         self.check_payload_size(payload.len())?;
 
         let (token, reply_to) = {
@@ -608,7 +742,7 @@ impl Client {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<Message, Error> {
-        self.check_closed()?;
+        self.check_closed_or_draining()?;
         self.check_payload_size(payload.len())?;
 
         let (token, reply_to) = {
@@ -656,12 +790,77 @@ impl Client {
         }
     }
 
+    fn check_closed_or_draining(&self) -> Result<(), Error> {
+        let inner = self.inner.borrow();
+        if inner.closed || inner.draining {
+            Err(match &inner.close_error {
+                Some(msg) => Error::Server(msg.clone()),
+                None => Error::Disconnected,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Return an asynchronous stream of connection lifecycle events.
+    pub fn events(&self) -> Events {
+        let mut inner = self.inner.borrow_mut();
+        let listener_id = inner.next_listener_id;
+        inner.next_listener_id += 1;
+        let mut initial_queue = VecDeque::new();
+        if !inner.closed {
+            initial_queue.push_back(Event::Connected);
+        }
+        inner
+            .event_listeners
+            .insert(listener_id, (initial_queue, None));
+        Events {
+            listener_id,
+            inner: Rc::clone(&self.inner),
+        }
+    }
+
     /// Close the connection. Background loops will terminate.
     pub fn close(&self) {
         let mut inner = self.inner.borrow_mut();
-        inner.closed = true;
-        inner._socket = None;
-        wake_all(&mut inner);
+        if !inner.closed {
+            inner.closed = true;
+            inner._socket = None;
+            inner.emit_event(Event::Disconnected);
+            wake_all(&mut inner);
+        }
+    }
+
+    /// Drain the client connection gracefully.
+    ///
+    /// Unsubscribes all active subscriptions, flushes all pending published messages
+    /// to the server, waits up to `timeout` for all buffered subscription messages
+    /// to be processed by client code, and then closes the connection.
+    pub async fn drain(&self, timeout: Duration) -> Result<(), Error> {
+        self.check_closed()?;
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.draining {
+                return Ok(());
+            }
+            inner.draining = true;
+            let sids: Vec<String> = inner.subscriptions.keys().cloned().collect();
+            for sid in &sids {
+                let unsub = proto::encode_unsub(sid, None);
+                inner.write_buf.extend_from_slice(&unsub);
+                if let Some(mb) = inner.mailboxes.get_mut(sid) {
+                    mb.draining = true;
+                }
+            }
+            inner.subscriptions.clear();
+            if let Some(w) = inner.flush_waker.take() {
+                w.wake();
+            }
+        }
+        self.flush(timeout).await?;
+        with_timeout(timeout, DrainWait { inner: &self.inner }).await??;
+        self.close();
+        Ok(())
     }
 
     /// Flush pending writes and wait for a PONG from the server, confirming
@@ -716,6 +915,11 @@ impl Client {
         }
         if let Some(mb) = mailbox {
             if let Some(w) = mb.waker {
+                w.wake();
+            }
+        }
+        if inner.draining && inner.mailboxes.values().all(|m| m.queue.is_empty()) {
+            for w in std::mem::take(&mut inner.drain_wakers) {
                 w.wake();
             }
         }
@@ -965,14 +1169,46 @@ impl<'a> Future for NextMessage<'a> {
                 None => Error::Disconnected,
             }));
         }
-        if let Some(mailbox) = inner.mailboxes.get_mut(self.sid) {
+        let is_draining = if let Some(mailbox) = inner.mailboxes.get_mut(self.sid) {
             if let Some(msg) = mailbox.queue.pop_front() {
                 return Poll::Ready(Ok(msg));
             }
-            mailbox.waker = Some(cx.waker().clone());
+            if mailbox.draining {
+                true
+            } else {
+                mailbox.waker = Some(cx.waker().clone());
+                false
+            }
         } else {
             return Poll::Ready(Err(Error::Disconnected));
+        };
+
+        if is_draining {
+            inner.mailboxes.remove(self.sid);
+            if inner.draining && inner.mailboxes.values().all(|m| m.queue.is_empty()) {
+                for w in std::mem::take(&mut inner.drain_wakers) {
+                    w.wake();
+                }
+            }
+            return Poll::Ready(Err(Error::Disconnected));
         }
+        Poll::Pending
+    }
+}
+
+struct DrainWait<'a> {
+    inner: &'a Rc<RefCell<Inner>>,
+}
+
+impl<'a> Future for DrainWait<'a> {
+    type Output = Result<(), Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mailboxes.is_empty() || inner.mailboxes.values().all(|m| m.queue.is_empty()) {
+            return Poll::Ready(Ok(()));
+        }
+        inner.drain_wakers.push(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -1069,6 +1305,7 @@ async fn read_loop(
 
         if buf.len() == prev_len {
             // Stream ended — connection lost.
+            inner.borrow_mut().emit_event(Event::Disconnected);
             if config.max_reconnect_attempts == 0 {
                 let mut inner = inner.borrow_mut();
                 inner.closed = true;
@@ -1339,16 +1576,17 @@ async fn attempt_reconnect(
             inner_ref._socket = Some(socket);
             inner_ref.new_writer = Some(tx);
             inner_ref.writer_failed = false;
+            inner_ref.emit_event(Event::Reconnected(addr.clone()));
             if let Some(w) = inner_ref.flush_waker.take() {
                 w.wake();
             }
         }
 
         // Drain background futures so they don't leak.
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             let _ = rx_fut.await;
         });
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             let _ = send_fut.await;
         });
 
@@ -1398,6 +1636,7 @@ pub(crate) fn crypto_random_u64() -> u64 {
 
 /// Extract server name for TLS SNI, handling IPv6 bracketed literals like "[::1]:4222"
 /// and stripping URL schemes.
+#[cfg(any(feature = "tls", test))]
 pub(crate) fn extract_server_name(addr: &str) -> String {
     let addr = addr.trim();
     let addr = addr
@@ -1480,6 +1719,7 @@ fn dispatch_op(inner: &Rc<RefCell<Inner>>, op: ServerOp) {
         }
         ServerOp::Err(msg) => {
             let mut inner = inner.borrow_mut();
+            inner.emit_event(Event::ServerError(msg.clone()));
             inner.closed = true;
             inner.close_error = Some(msg);
             wake_all(&mut inner);
@@ -1503,15 +1743,27 @@ fn dispatch_msg(inner: &Rc<RefCell<Inner>>, sid: &str, message: Message) {
     }
 
     let capacity = inner.mailbox_capacity;
-    if let Some(mailbox) = inner.mailboxes.get_mut(sid) {
+    let dropped_info = if let Some(mailbox) = inner.mailboxes.get_mut(sid) {
         // Slow-consumer protection: drop the oldest message when at capacity.
-        if mailbox.queue.len() >= capacity {
-            mailbox.queue.pop_front();
-        }
+        let dropped = if mailbox.queue.len() >= capacity {
+            mailbox.queue.pop_front()
+        } else {
+            None
+        };
         mailbox.queue.push_back(message);
         if let Some(w) = mailbox.waker.take() {
             w.wake();
         }
+        dropped.map(|m| m.subject)
+    } else {
+        None
+    };
+
+    if let Some(subject) = dropped_info {
+        inner.emit_event(Event::SlowConsumerDropped {
+            sid: sid.to_string(),
+            subject,
+        });
     }
 }
 
@@ -1530,6 +1782,14 @@ fn wake_all(inner: &mut Inner) {
         w.wake();
     }
     for w in std::mem::take(&mut inner.pong_wakers) {
+        w.wake();
+    }
+    for (_, waker) in inner.event_listeners.values_mut() {
+        if let Some(w) = waker.take() {
+            w.wake();
+        }
+    }
+    for w in std::mem::take(&mut inner.drain_wakers) {
         w.wake();
     }
 }
@@ -1581,11 +1841,10 @@ impl<'a> Future for FlushWait<'a> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.closed {
-            Poll::Ready(())
-        } else if inner.new_writer.is_some() {
-            Poll::Ready(())
-        } else if !inner.write_buf.is_empty() && !inner.writer_failed {
+        if inner.closed
+            || inner.new_writer.is_some()
+            || (!inner.write_buf.is_empty() && !inner.writer_failed)
+        {
             Poll::Ready(())
         } else {
             inner.flush_waker = Some(cx.waker().clone());
@@ -1636,9 +1895,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mux_inbox_dispatch_and_raii_cleanup() {
-        let inner = Rc::new(RefCell::new(Inner {
+    fn test_server_info() -> ServerInfo {
+        ServerInfo {
+            server_id: "test".into(),
+            server_name: "test".into(),
+            version: "1.0.0".into(),
+            host: "localhost".into(),
+            port: 4222,
+            max_payload: 1024,
+            headers: true,
+            tls_required: false,
+            tls_available: false,
+            connect_urls: vec![],
+            nonce: None,
+            jetstream: true,
+        }
+    }
+
+    fn test_inner() -> Inner {
+        Inner {
             _socket: None,
             mailboxes: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -1658,7 +1933,16 @@ mod tests {
             mailbox_capacity: 64,
             write_buf_limit: 1024,
             max_payload: 1024,
-        }));
+            draining: false,
+            drain_wakers: Vec::new(),
+            next_listener_id: 1,
+            event_listeners: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn mux_inbox_dispatch_and_raii_cleanup() {
+        let inner = Rc::new(RefCell::new(test_inner()));
 
         let token = "deadbeef01020304".to_string();
         inner.borrow_mut().pending_requests.insert(
@@ -1707,27 +1991,7 @@ mod tests {
 
     #[test]
     fn pong_tracking_wakes_all_waiters() {
-        let inner = Rc::new(RefCell::new(Inner {
-            _socket: None,
-            mailboxes: HashMap::new(),
-            subscriptions: HashMap::new(),
-            pending_requests: HashMap::new(),
-            inbox_prefix: "_INBOX.testclient.".to_string(),
-            write_buf: Vec::new(),
-            flush_waker: None,
-            pong_wakers: Vec::new(),
-            pongs_received: 0,
-            next_id: 1,
-            closed: false,
-            close_error: None,
-            new_writer: None,
-            writer_failed: false,
-            allow_advertised_servers: false,
-            known_servers: Vec::new(),
-            mailbox_capacity: 64,
-            write_buf_limit: 1024,
-            max_payload: 1024,
-        }));
+        let inner = Rc::new(RefCell::new(test_inner()));
 
         assert_eq!(inner.borrow().pongs_received, 0);
         dispatch_op(&inner, ServerOp::Pong);
@@ -1761,27 +2025,7 @@ mod tests {
 
     #[test]
     fn unsubscribe_sid_removes_mailbox_and_wakes_waiter() {
-        let inner = Rc::new(RefCell::new(Inner {
-            _socket: None,
-            mailboxes: HashMap::new(),
-            subscriptions: HashMap::new(),
-            pending_requests: HashMap::new(),
-            inbox_prefix: "_INBOX.test.".to_string(),
-            write_buf: Vec::new(),
-            flush_waker: None,
-            pong_wakers: Vec::new(),
-            pongs_received: 0,
-            next_id: 1,
-            closed: false,
-            close_error: None,
-            new_writer: None,
-            writer_failed: false,
-            allow_advertised_servers: false,
-            known_servers: Vec::new(),
-            mailbox_capacity: 64,
-            write_buf_limit: 1024,
-            max_payload: 1024,
-        }));
+        let inner = Rc::new(RefCell::new(test_inner()));
 
         let client = Client {
             inner: Rc::clone(&inner),
@@ -1808,6 +2052,7 @@ mod tests {
             Mailbox {
                 queue: VecDeque::new(),
                 waker: None,
+                draining: false,
             },
         );
 
@@ -1826,27 +2071,7 @@ mod tests {
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
-        let inner = Rc::new(RefCell::new(Inner {
-            _socket: None,
-            mailboxes: HashMap::new(),
-            subscriptions: HashMap::new(),
-            pending_requests: HashMap::new(),
-            inbox_prefix: "_INBOX.test.".to_string(),
-            write_buf: Vec::new(),
-            flush_waker: None,
-            pong_wakers: Vec::new(),
-            pongs_received: 0,
-            next_id: 1,
-            closed: false,
-            close_error: None,
-            new_writer: None,
-            writer_failed: false,
-            allow_advertised_servers: false,
-            known_servers: Vec::new(),
-            mailbox_capacity: 64,
-            write_buf_limit: 1024,
-            max_payload: 1024,
-        }));
+        let inner = Rc::new(RefCell::new(test_inner()));
 
         let mut pong_wait = PongWait {
             inner: &inner,
@@ -1858,5 +2083,232 @@ mod tests {
         assert_eq!(inner.borrow().pong_wakers.len(), 1);
         let _ = Pin::new(&mut pong_wait).poll(&mut cx);
         assert_eq!(inner.borrow().pong_wakers.len(), 1);
+    }
+
+    #[test]
+    fn subscription_drain_yields_buffered_then_disconnects() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        let inner = Rc::new(RefCell::new(test_inner()));
+        let sid = "sub_drain_1";
+
+        let mut queue = VecDeque::new();
+        queue.push_back(Message {
+            subject: "test".into(),
+            reply_to: None,
+            headers: None,
+            payload: b"msg1".to_vec(),
+        });
+        queue.push_back(Message {
+            subject: "test".into(),
+            reply_to: None,
+            headers: None,
+            payload: b"msg2".to_vec(),
+        });
+
+        inner.borrow_mut().mailboxes.insert(
+            sid.to_string(),
+            Mailbox {
+                queue,
+                waker: None,
+                draining: false,
+            },
+        );
+        inner.borrow_mut().subscriptions.insert(
+            sid.to_string(),
+            SubInfo {
+                subject: "test".into(),
+                queue: None,
+            },
+        );
+
+        let sub = Subscription {
+            sid: sid.to_string(),
+            inner: Rc::clone(&inner),
+        };
+
+        // Call drain
+        sub.drain();
+        // Server UNSUB must be queued
+        assert!(inner.borrow().write_buf.starts_with(b"UNSUB sub_drain_1\r\n"));
+        // SubInfo is removed so it won't resubscribe on reconnect
+        assert!(!inner.borrow().subscriptions.contains_key(sid));
+        // Mailbox still exists because 2 messages are buffered
+        assert!(inner.borrow().mailboxes.contains_key(sid));
+
+        // Poll first message
+        let mut next1 = NextMessage {
+            sid,
+            inner: &inner,
+        };
+        match Pin::new(&mut next1).poll(&mut cx) {
+            Poll::Ready(Ok(m)) => assert_eq!(m.payload, b"msg1"),
+            other => panic!("expected Ready(Ok(msg1)), got {other:?}"),
+        }
+
+        // Poll second message
+        let mut next2 = NextMessage {
+            sid,
+            inner: &inner,
+        };
+        match Pin::new(&mut next2).poll(&mut cx) {
+            Poll::Ready(Ok(m)) => assert_eq!(m.payload, b"msg2"),
+            other => panic!("expected Ready(Ok(msg2)), got {other:?}"),
+        }
+
+        // Poll third time: queue is now empty and draining -> Disconnected
+        let mut next3 = NextMessage {
+            sid,
+            inner: &inner,
+        };
+        match Pin::new(&mut next3).poll(&mut cx) {
+            Poll::Ready(Err(Error::Disconnected)) => {}
+            other => panic!("expected Ready(Err(Disconnected)), got {other:?}"),
+        }
+
+        // Mailbox should be cleaned up
+        assert!(!inner.borrow().mailboxes.contains_key(sid));
+    }
+
+    #[test]
+    fn events_stream_emits_connected_disconnected_and_server_error() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        let inner = Rc::new(RefCell::new(test_inner()));
+        let client = Client {
+            inner: Rc::clone(&inner),
+            info: Rc::new(test_server_info()),
+            refcount: Rc::new(Cell::new(1)),
+        };
+
+        let events = client.events();
+        // First event is Connected
+        let mut next_fut = NextEvent {
+            listener_id: events.listener_id,
+            inner: &inner,
+        };
+        assert_eq!(
+            Pin::new(&mut next_fut).poll(&mut cx),
+            Poll::Ready(Some(Event::Connected))
+        );
+
+        // Server error op
+        dispatch_op(&inner, ServerOp::Err("Slow consumer".into()));
+        let mut next_fut = NextEvent {
+            listener_id: events.listener_id,
+            inner: &inner,
+        };
+        assert_eq!(
+            Pin::new(&mut next_fut).poll(&mut cx),
+            Poll::Ready(Some(Event::ServerError("Slow consumer".into())))
+        );
+
+        // Client is now closed, NextEvent should yield None
+        let mut next_fut = NextEvent {
+            listener_id: events.listener_id,
+            inner: &inner,
+        };
+        assert_eq!(Pin::new(&mut next_fut).poll(&mut cx), Poll::Ready(None));
+
+        // Dropping events removes listener from inner
+        drop(events);
+        assert!(inner.borrow().event_listeners.is_empty());
+    }
+
+    #[test]
+    fn slow_consumer_dropped_event_is_emitted() {
+        use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|p| RawWaker::new(p, &VTABLE), |_| {}, |_| {}, |_| {});
+        let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw_waker) };
+        let mut cx = Context::from_waker(&waker);
+
+        let inner = Rc::new(RefCell::new(test_inner()));
+        inner.borrow_mut().mailbox_capacity = 2;
+
+        let client = Client {
+            inner: Rc::clone(&inner),
+            info: Rc::new(test_server_info()),
+            refcount: Rc::new(Cell::new(1)),
+        };
+
+        let events = client.events();
+
+        let sid = "sub_test";
+        inner.borrow_mut().mailboxes.insert(
+            sid.to_string(),
+            Mailbox {
+                queue: VecDeque::new(),
+                waker: None,
+                draining: false,
+            },
+        );
+
+        // Dispatch 2 messages (fills capacity)
+        dispatch_msg(
+            &inner,
+            sid,
+            Message {
+                subject: "sub.test".into(),
+                reply_to: None,
+                headers: None,
+                payload: b"1".to_vec(),
+            },
+        );
+        dispatch_msg(
+            &inner,
+            sid,
+            Message {
+                subject: "sub.test".into(),
+                reply_to: None,
+                headers: None,
+                payload: b"2".to_vec(),
+            },
+        );
+
+        // Third message triggers slow consumer drop of message "1"
+        dispatch_msg(
+            &inner,
+            sid,
+            Message {
+                subject: "sub.test".into(),
+                reply_to: None,
+                headers: None,
+                payload: b"3".to_vec(),
+            },
+        );
+
+        // Next event should be Connected, then SlowConsumerDropped
+        let mut next_fut = NextEvent {
+            listener_id: events.listener_id,
+            inner: &inner,
+        };
+        assert_eq!(
+            Pin::new(&mut next_fut).poll(&mut cx),
+            Poll::Ready(Some(Event::Connected))
+        );
+
+        let mut next_fut = NextEvent {
+            listener_id: events.listener_id,
+            inner: &inner,
+        };
+        assert_eq!(
+            Pin::new(&mut next_fut).poll(&mut cx),
+            Poll::Ready(Some(Event::SlowConsumerDropped {
+                sid: sid.to_string(),
+                subject: "sub.test".to_string(),
+            }))
+        );
     }
 }

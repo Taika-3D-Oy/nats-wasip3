@@ -10,7 +10,7 @@ Store), and KV with CAS. Uses **native WASI 0.3 Component Model async I/O** (`wa
 - **Runtime**: [wasmCloud](https://wasmcloud.com) ≥ 2.7.0, or [Wasmtime](https://wasmtime.dev) ≥ 47 (with WASI 0.3 / component-model-async support)
 - **nats-server** (for running tests)
 
-The included `rust-toolchain.toml` pins the stable toolchain and `wasm32-wasip2` target automatically. WASI 0.3 Component Model async I/O compiles directly with stable Rust using the `wasip3` (0.7+) and `wit-bindgen` (0.57+) crates.
+The included `rust-toolchain.toml` pins the stable toolchain and `wasm32-wasip2` target automatically. WASI 0.3 Component Model async I/O compiles directly with stable Rust using the `wasip3` (0.9+) and `wit-bindgen` (0.62+) crates.
 
 ## Building
 
@@ -131,6 +131,66 @@ while let Ok(req) = sub.next().await {
 
 [ADR-32]: https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-32.md
 
+## Connection Lifecycle Events
+
+Monitor connection health and server notifications asynchronously using `client.events()`:
+
+```rust,ignore
+use nats_wasip3::{Client, ConnectConfig, Event};
+
+let client = Client::connect(ConnectConfig::default()).await?;
+let mut events = client.events();
+
+wit_bindgen::spawn_local(async move {
+    while let Some(event) = events.next().await {
+        match event {
+            Event::Connected => println!("Connected to NATS"),
+            Event::Disconnected => println!("Disconnected from NATS"),
+            Event::Reconnected(url) => println!("Reconnected to {url}"),
+            Event::SlowConsumerDropped { sid, subject } => {
+                eprintln!("Slow consumer dropped message on {subject} (sid: {sid})");
+            }
+            Event::ServerError(err) => eprintln!("NATS server error: {err}"),
+        }
+    }
+});
+```
+
+## Graceful Draining
+
+Drain subscriptions or entire client connections cleanly without dropping in-flight messages:
+
+```rust,ignore
+// Drain a single subscription: stops new server delivery but yields remaining buffered messages
+sub.drain();
+while let Ok(msg) = sub.next().await {
+    process(msg);
+}
+
+// Drain the entire client: unsubs all subscriptions, flushes outbound writes,
+// waits up to timeout for message queues to empty, and closes the connection cleanly
+client.drain(nats_wasip3::secs(5)).await?;
+```
+
+## JetStream Stream & Consumer Discovery
+
+Inspect and paginate streams and consumers:
+
+```rust,ignore
+use nats_wasip3::{Client, ConnectConfig, JetStream};
+
+let client = Client::connect(ConnectConfig::default()).await?;
+let js = JetStream::new(client);
+
+// List all stream names or detailed stream info
+let stream_names = js.stream_names().await?;
+let streams = js.list_streams().await?;
+
+// List consumer names or detailed consumer info
+let consumer_names = js.consumer_names("ORDERS").await?;
+let consumers = js.list_consumers("ORDERS").await?;
+```
+
 ## KV watch and management APIs
 
 The KV API includes nats.rs-style watch variants and key patterns:
@@ -147,7 +207,7 @@ The KV API includes nats.rs-style watch variants and key patterns:
 ## Quick start
 
 ```rust
-use nats_wasip3::client::{Client, ConnectConfig};
+use nats_wasip3::{Client, ConnectConfig};
 
 wasip3::cli::command::export!(NatsDemo);
 
@@ -185,7 +245,7 @@ This crate talks directly to WASI P3 Component Model primitives:
   (true CM async, not pollable-based)
 - **`StreamReader<u8>` / `StreamWriter<u8>`** — unidirectional byte streams
   from `socket.receive()` / `socket.send()` (each callable once per socket)
-- **`wit_bindgen::spawn`** — concurrent background tasks (read loop, flush
+- **`wit_bindgen::spawn_local`** — concurrent background tasks (read loop, flush
   loop)
 - **`wit_bindgen::block_on`** — CM async executor for `fn main()`
 - **`wasip3::clocks::monotonic_clock::wait_for(nanos)`** — native async

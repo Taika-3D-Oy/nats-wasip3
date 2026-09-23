@@ -40,7 +40,7 @@ pub async fn tls_upgrade(
     let (cleartext_from_net, recv_error_future) = connector.receive(tcp_rx);
 
     // Forward encrypted output to the TCP socket in the background.
-    wit_bindgen::spawn(forward_stream(ciphertext_to_net, tcp_tx));
+    wit_bindgen::spawn_local(forward_stream(ciphertext_to_net, tcp_tx));
 
     // Perform the TLS handshake.
     Connector::connect(connector, server_name.to_string())
@@ -48,7 +48,7 @@ pub async fn tls_upgrade(
         .map_err(|e| Error::Tls(e.to_debug_string()))?;
 
     // Monitor error futures so they don't leak, and report host TLS alert/stream errors.
-    wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         if let Err(e) = send_error_future.await {
             eprintln!(
                 "[nats-wasip3] TLS send stream error: {}",
@@ -56,7 +56,7 @@ pub async fn tls_upgrade(
             );
         }
     });
-    wit_bindgen::spawn(async move {
+    wit_bindgen::spawn_local(async move {
         if let Err(e) = recv_error_future.await {
             eprintln!(
                 "[nats-wasip3] TLS receive stream error: {}",

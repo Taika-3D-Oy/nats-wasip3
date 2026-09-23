@@ -56,7 +56,8 @@ pub use error::Error;
 // Users should import from the crate root rather than sub-modules.
 
 pub use client::{
-    millis, secs, with_timeout, Client, ConnectConfig, Duration, Message, Subscription,
+    millis, secs, with_timeout, Client, ConnectConfig, Duration, Event, Events, Message,
+    Subscription,
 };
 pub use proto::{Headers, ServerInfo};
 
@@ -68,7 +69,10 @@ pub use service::{
 };
 
 #[cfg(feature = "jetstream")]
-pub use jetstream::{DirectMessage, MsgMetadata, OrderedConsumer, OrderedConsumerConfig};
+pub use jetstream::{
+    ConsumerConfig, ConsumerInfo, DirectMessage, JetStream, MsgMetadata, OrderedConsumer,
+    OrderedConsumerConfig, StreamConfig, StreamInfo, StreamState,
+};
 
 #[cfg(feature = "jetstream")]
 pub use object_store::{

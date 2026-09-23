@@ -121,6 +121,100 @@ impl JetStream {
         self.api_request_empty(&format!("STREAM.INFO.{name}")).await
     }
 
+    /// Return the names of all streams.
+    pub async fn stream_names(&self) -> Result<Vec<String>, Error> {
+        self.stream_names_filtered(None).await
+    }
+
+    /// Return the names of streams filtered by an optional subject.
+    pub async fn stream_names_filtered(
+        &self,
+        filter_subject: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        #[derive(Serialize)]
+        struct StreamNamesReq<'a> {
+            offset: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            subject: Option<&'a str>,
+        }
+
+        #[derive(Deserialize)]
+        struct StreamNamesResp {
+            #[serde(default)]
+            streams: Option<Vec<String>>,
+            #[serde(default)]
+            total: usize,
+        }
+
+        let mut all_names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let req = StreamNamesReq {
+                offset,
+                subject: filter_subject,
+            };
+            let resp: StreamNamesResp = self.api_request("STREAM.NAMES", &req).await?;
+            let streams = resp.streams.unwrap_or_default();
+            if streams.is_empty() {
+                break;
+            }
+            let count = streams.len();
+            all_names.extend(streams);
+            offset += count;
+            if all_names.len() >= resp.total {
+                break;
+            }
+        }
+        Ok(all_names)
+    }
+
+    /// List all streams and their current state.
+    pub async fn list_streams(&self) -> Result<Vec<StreamInfo>, Error> {
+        self.list_streams_filtered(None).await
+    }
+
+    /// List streams and their current state, filtered by an optional subject.
+    pub async fn list_streams_filtered(
+        &self,
+        filter_subject: Option<&str>,
+    ) -> Result<Vec<StreamInfo>, Error> {
+        #[derive(Serialize)]
+        struct StreamListReq<'a> {
+            offset: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            subject: Option<&'a str>,
+        }
+
+        #[derive(Deserialize)]
+        struct StreamListResp {
+            #[serde(default)]
+            streams: Option<Vec<StreamInfo>>,
+            #[serde(default)]
+            total: usize,
+        }
+
+        let mut all_streams = Vec::new();
+        let mut offset = 0;
+        loop {
+            let req = StreamListReq {
+                offset,
+                subject: filter_subject,
+            };
+            let resp: StreamListResp = self.api_request("STREAM.LIST", &req).await?;
+            let streams = resp.streams.unwrap_or_default();
+            if streams.is_empty() {
+                break;
+            }
+            let count = streams.len();
+            all_streams.extend(streams);
+            offset += count;
+            if all_streams.len() >= resp.total {
+                break;
+            }
+        }
+        Ok(all_streams)
+    }
+
     /// Purge all messages from a stream.
     pub async fn purge_stream(&self, name: &str) -> Result<PurgeResponse, Error> {
         self.api_request_empty(&format!("STREAM.PURGE.{name}"))
@@ -202,6 +296,78 @@ impl JetStream {
             .api_request_empty(&format!("CONSUMER.DELETE.{stream}.{consumer}"))
             .await?;
         Ok(resp.success)
+    }
+
+    /// Return the names of all consumers on a stream.
+    pub async fn consumer_names(&self, stream: &str) -> Result<Vec<String>, Error> {
+        #[derive(Serialize)]
+        struct ConsumerNamesReq {
+            offset: usize,
+        }
+
+        #[derive(Deserialize)]
+        struct ConsumerNamesResp {
+            #[serde(default)]
+            consumers: Option<Vec<String>>,
+            #[serde(default)]
+            total: usize,
+        }
+
+        let mut all_names = Vec::new();
+        let mut offset = 0;
+        loop {
+            let req = ConsumerNamesReq { offset };
+            let resp: ConsumerNamesResp = self
+                .api_request(&format!("CONSUMER.NAMES.{stream}"), &req)
+                .await?;
+            let consumers = resp.consumers.unwrap_or_default();
+            if consumers.is_empty() {
+                break;
+            }
+            let count = consumers.len();
+            all_names.extend(consumers);
+            offset += count;
+            if all_names.len() >= resp.total {
+                break;
+            }
+        }
+        Ok(all_names)
+    }
+
+    /// List all consumers and their state on a stream.
+    pub async fn list_consumers(&self, stream: &str) -> Result<Vec<ConsumerInfo>, Error> {
+        #[derive(Serialize)]
+        struct ConsumerListReq {
+            offset: usize,
+        }
+
+        #[derive(Deserialize)]
+        struct ConsumerListResp {
+            #[serde(default)]
+            consumers: Option<Vec<ConsumerInfo>>,
+            #[serde(default)]
+            total: usize,
+        }
+
+        let mut all_consumers = Vec::new();
+        let mut offset = 0;
+        loop {
+            let req = ConsumerListReq { offset };
+            let resp: ConsumerListResp = self
+                .api_request(&format!("CONSUMER.LIST.{stream}"), &req)
+                .await?;
+            let consumers = resp.consumers.unwrap_or_default();
+            if consumers.is_empty() {
+                break;
+            }
+            let count = consumers.len();
+            all_consumers.extend(consumers);
+            offset += count;
+            if all_consumers.len() >= resp.total {
+                break;
+            }
+        }
+        Ok(all_consumers)
     }
 
     /// Fetch messages from a pull consumer (simple one-shot fetch).
@@ -705,7 +871,7 @@ pub struct StreamConfig {
     ///
     /// Implicitly enables `allow_rollup_hdrs`. Cannot be set on mirror or
     /// source streams. Once enabled it cannot be disabled.
-    /// See [`nats_wasip3::schedule`] for the client-side API.
+    /// See [`crate::schedule`] for the client-side API.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_msg_schedules: bool,
     /// Mirror another stream into this one.
@@ -833,14 +999,14 @@ pub enum DiscardPolicy {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub config: StreamConfig,
     pub state: StreamState,
 }
 
 #[non_exhaustive]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamState {
     pub messages: u64,
     pub bytes: u64,
@@ -948,7 +1114,7 @@ pub enum AckPolicy {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerInfo {
     pub name: String,
     pub config: ConsumerConfig,
@@ -1256,5 +1422,105 @@ mod tests {
         assert_eq!(meta.consumer_sequence, 84);
         assert_eq!(meta.timestamp_nanos, 1700000000000000123);
         assert_eq!(meta.num_pending, 10);
+    }
+
+    #[test]
+    fn test_stream_names_response_deserialization() {
+        let json = r#"{"total": 2, "offset": 0, "limit": 1024, "streams": ["STREAM_A", "STREAM_B"]}"#;
+        #[derive(Deserialize)]
+        struct StreamNamesResp {
+            #[serde(default)]
+            streams: Option<Vec<String>>,
+            #[serde(default)]
+            total: usize,
+        }
+        let resp: StreamNamesResp = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.streams.unwrap(), vec!["STREAM_A", "STREAM_B"]);
+    }
+
+    #[test]
+    fn test_stream_list_response_deserialization() {
+        let json = r#"{
+            "total": 1,
+            "offset": 0,
+            "limit": 256,
+            "streams": [
+                {
+                    "config": {
+                        "name": "TEST_STREAM",
+                        "subjects": ["test.>"],
+                        "retention": "limits"
+                    },
+                    "state": {
+                        "messages": 100,
+                        "bytes": 2048,
+                        "first_seq": 1,
+                        "last_seq": 100,
+                        "consumer_count": 2
+                    }
+                }
+            ]
+        }"#;
+        #[derive(Deserialize)]
+        struct StreamListResp {
+            #[serde(default)]
+            streams: Option<Vec<StreamInfo>>,
+            #[serde(default)]
+            total: usize,
+        }
+        let resp: StreamListResp = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.total, 1);
+        let info = &resp.streams.unwrap()[0];
+        assert_eq!(info.config.name, "TEST_STREAM");
+        assert_eq!(info.state.messages, 100);
+        assert_eq!(info.state.consumer_count, 2);
+    }
+
+    #[test]
+    fn test_consumer_names_and_list_response_deserialization() {
+        let json_names =
+            r#"{"total": 2, "offset": 0, "limit": 1024, "consumers": ["cons_1", "cons_2"]}"#;
+        #[derive(Deserialize)]
+        struct ConsumerNamesResp {
+            #[serde(default)]
+            consumers: Option<Vec<String>>,
+            #[serde(default)]
+            total: usize,
+        }
+        let resp: ConsumerNamesResp = serde_json::from_str(json_names).unwrap();
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.consumers.unwrap(), vec!["cons_1", "cons_2"]);
+
+        let json_list = r#"{
+            "total": 1,
+            "offset": 0,
+            "limit": 256,
+            "consumers": [
+                {
+                    "name": "cons_1",
+                    "config": {
+                        "durable_name": "cons_1",
+                        "ack_policy": "explicit"
+                    },
+                    "num_pending": 42,
+                    "num_ack_pending": 3
+                }
+            ]
+        }"#;
+        #[derive(Deserialize)]
+        struct ConsumerListResp {
+            #[serde(default)]
+            consumers: Option<Vec<ConsumerInfo>>,
+            #[serde(default)]
+            total: usize,
+        }
+        let resp_list: ConsumerListResp = serde_json::from_str(json_list).unwrap();
+        assert_eq!(resp_list.total, 1);
+        let cons = &resp_list.consumers.unwrap()[0];
+        assert_eq!(cons.name, "cons_1");
+        assert_eq!(cons.num_pending, 42);
+        assert_eq!(cons.num_ack_pending, 3);
+        assert_eq!(cons.config.durable_name.as_deref(), Some("cons_1"));
     }
 }

@@ -523,7 +523,7 @@ fn spawn_control_handlers(
         let client = client.clone();
         let endpoints = Rc::clone(&endpoints);
 
-        wit_bindgen::spawn(async move {
+        wit_bindgen::spawn_local(async move {
             while let Ok(msg) = sub.next().await {
                 let reply = match msg.reply_to.as_deref() {
                     Some(r) => r,
