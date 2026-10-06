@@ -12,6 +12,18 @@ Store), and KV with CAS. Uses **native WASI 0.3 Component Model async I/O** (`wa
 
 The included `rust-toolchain.toml` pins the stable toolchain and `wasm32-wasip2` target automatically. WASI 0.3 Component Model async I/O compiles directly with stable Rust using the `wasip3` (0.9+) and `wit-bindgen` (0.62+) crates.
 
+> **Important — single async runtime per component:** this crate uses
+> `wit-bindgen`'s async executor (`spawn_local`) for its background read/write
+> loops. The host component **must depend on the same `wit-bindgen` and
+> `wasip3` versions** as this crate. Each wit-bindgen version has its own
+> crate-local task queue, and only the queue belonging to the version that
+> generated the component's exports is ever pumped. A version mix (e.g. host
+> on wit-bindgen 0.57 + this crate on 0.62) compiles and links fine, but the
+> NATS connection handshake — awaited inline — will succeed while every
+> subsequent request silently starves and times out. Check with
+> `cargo tree | grep -E 'wasip3|wit-bindgen'`: there must be exactly one
+> version of each in the tree.
+
 ## Building
 
 ```sh
