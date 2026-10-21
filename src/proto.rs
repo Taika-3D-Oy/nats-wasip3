@@ -149,9 +149,10 @@ impl Headers {
 
     /// Encode a status-line header block: `NATS/1.0 {status}\r\n...\r\n`
     pub fn encode_with_status(&self, status: &str) -> Vec<u8> {
+        let clean_status = status.replace(['\r', '\n', '\0'], "");
         let mut buf = Vec::new();
         buf.extend_from_slice(b"NATS/1.0 ");
-        buf.extend_from_slice(status.as_bytes());
+        buf.extend_from_slice(clean_status.as_bytes());
         buf.extend_from_slice(b"\r\n");
         for (k, v) in &self.entries {
             buf.extend_from_slice(k.as_bytes());
@@ -302,6 +303,9 @@ pub fn encode_hpub(
 pub const PING: &[u8] = b"PING\r\n";
 pub const PONG: &[u8] = b"PONG\r\n";
 
+/// Maximum frame payload/total size accepted from the wire (64 MiB).
+pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024 * 1024;
+
 /// Validate a NATS subject or token for illegal characters.
 ///
 /// Subjects must not be empty or contain spaces, tabs, `\r`, or `\n`.
@@ -336,6 +340,74 @@ pub(crate) fn validate_bucket_name(bucket: &str) -> Result<(), crate::Error> {
     {
         return Err(crate::Error::Protocol(format!(
             "invalid bucket name '{bucket}': must contain only alphanumeric characters, dashes, and underscores"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a single NATS KV key.
+///
+/// Keys must not be empty, start or end with `.`, contain empty tokens (`..`),
+/// contain NATS wildcards (`*`, `>`), or contain whitespace/control characters.
+pub(crate) fn validate_kv_key(key: &str) -> Result<(), crate::Error> {
+    if key.is_empty() {
+        return Err(crate::Error::Protocol("KV key must not be empty".into()));
+    }
+    if key.starts_with('.') || key.ends_with('.') || key.contains("..") {
+        return Err(crate::Error::Protocol(format!(
+            "invalid KV key '{key}': must not start/end with '.' or contain '..'"
+        )));
+    }
+    if key
+        .bytes()
+        .any(|b| b <= 0x20 || b == 0x7f || b == b'*' || b == b'>')
+    {
+        return Err(crate::Error::Protocol(format!(
+            "invalid KV key '{key}': must not contain wildcards, whitespace, or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a NATS KV watch/filter pattern.
+///
+/// Unlike a concrete key, watch patterns may include `*` and `>` wildcards,
+/// but must not be empty, start/end with `.`, contain `..`, or contain
+/// whitespace/control characters.
+pub(crate) fn validate_kv_watch_pattern(pattern: &str) -> Result<(), crate::Error> {
+    if pattern.is_empty() {
+        return Err(crate::Error::Protocol(
+            "KV watch pattern must not be empty".into(),
+        ));
+    }
+    if pattern.starts_with('.') || pattern.ends_with('.') || pattern.contains("..") {
+        return Err(crate::Error::Protocol(format!(
+            "invalid KV watch pattern '{pattern}': must not start/end with '.' or contain '..'"
+        )));
+    }
+    if pattern.bytes().any(|b| b <= 0x20 || b == 0x7f) {
+        return Err(crate::Error::Protocol(format!(
+            "invalid KV watch pattern '{pattern}': must not contain whitespace or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a JetStream identifier (stream name or consumer name).
+///
+/// Must not be empty or contain `.`, `*`, `>`, `/`, `\`, whitespace, or control characters.
+pub(crate) fn validate_js_identifier(name: &str, kind: &str) -> Result<(), crate::Error> {
+    if name.is_empty() {
+        return Err(crate::Error::Protocol(format!(
+            "{kind} name must not be empty"
+        )));
+    }
+    if name
+        .bytes()
+        .any(|b| b <= 0x20 || b == 0x7f || matches!(b, b'.' | b'*' | b'>' | b'/' | b'\\'))
+    {
+        return Err(crate::Error::Protocol(format!(
+            "invalid {kind} name '{name}': must not contain '.', '*', '>', '/', '\\', whitespace, or control characters"
         )));
     }
     Ok(())
@@ -396,12 +468,28 @@ fn parse_msg(
         _ => return Err(crate::Error::Protocol(format!("invalid MSG line: {line}"))),
     };
 
-    let payload_start = line_end + 2;
-    let payload_end = payload_start + payload_len;
-    let total = payload_end + 2; // trailing \r\n
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(crate::Error::Protocol(format!(
+            "MSG payload length {payload_len} exceeds maximum {MAX_FRAME_PAYLOAD}"
+        )));
+    }
+
+    let payload_start = line_end
+        .checked_add(2)
+        .ok_or_else(|| crate::Error::Protocol("MSG frame offset overflow".into()))?;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| crate::Error::Protocol("MSG payload length overflow".into()))?;
+    let total = payload_end
+        .checked_add(2)
+        .ok_or_else(|| crate::Error::Protocol("MSG total frame length overflow".into()))?;
 
     if buf.len() < total {
         return Ok(None); // need more data
+    }
+
+    if &buf[payload_end..total] != b"\r\n" {
+        return Err(crate::Error::Protocol("MSG missing trailing CRLF".into()));
     }
 
     Ok(Some((
@@ -441,16 +529,42 @@ fn parse_hmsg(
         _ => return Err(crate::Error::Protocol(format!("invalid HMSG line: {line}"))),
     };
 
-    let data_start = line_end + 2;
-    let data_end = data_start + total_len;
-    let total = data_end + 2; // trailing \r\n
+    // Minimum valid NATS header block is "NATS/1.0\r\n" (10 bytes), and
+    // header bytes cannot exceed total bytes.
+    if hdr_len < 10 || hdr_len > total_len {
+        return Err(crate::Error::Protocol(format!(
+            "invalid HMSG lengths: hdr_len={hdr_len}, total_len={total_len}"
+        )));
+    }
+    if total_len > MAX_FRAME_PAYLOAD {
+        return Err(crate::Error::Protocol(format!(
+            "HMSG total length {total_len} exceeds maximum {MAX_FRAME_PAYLOAD}"
+        )));
+    }
+
+    let data_start = line_end
+        .checked_add(2)
+        .ok_or_else(|| crate::Error::Protocol("HMSG frame offset overflow".into()))?;
+    let hdr_end = data_start
+        .checked_add(hdr_len)
+        .ok_or_else(|| crate::Error::Protocol("HMSG header offset overflow".into()))?;
+    let data_end = data_start
+        .checked_add(total_len)
+        .ok_or_else(|| crate::Error::Protocol("HMSG total length overflow".into()))?;
+    let total = data_end
+        .checked_add(2)
+        .ok_or_else(|| crate::Error::Protocol("HMSG total frame length overflow".into()))?;
 
     if buf.len() < total {
         return Ok(None); // need more data
     }
 
-    let hdr_bytes = &buf[data_start..data_start + hdr_len];
-    let payload = &buf[data_start + hdr_len..data_end];
+    if &buf[data_end..total] != b"\r\n" {
+        return Err(crate::Error::Protocol("HMSG missing trailing CRLF".into()));
+    }
+
+    let hdr_bytes = &buf[data_start..hdr_end];
+    let payload = &buf[hdr_end..data_end];
 
     let headers = parse_headers(hdr_bytes)?;
 
@@ -1018,5 +1132,56 @@ mod tests {
         assert!(h.try_insert("Key", "Value\r\nInjection").is_err());
         assert!(h.try_insert("Key\0Null", "Value").is_err());
         assert!(h.try_insert("Key", "Value\0Null").is_err());
+    }
+
+    #[test]
+    fn headers_encode_with_status_sanitizes_crlf() {
+        let h = Headers::new();
+        let encoded = h.encode_with_status("503 No Responders\r\nInjected: true\0");
+        let s = std::str::from_utf8(&encoded).unwrap();
+        assert_eq!(s, "NATS/1.0 503 No RespondersInjected: true\r\n\r\n");
+    }
+
+    #[test]
+    fn parse_hmsg_hdr_len_greater_than_total_len_rejected() {
+        let buf = b"HMSG subj 1 50 10\r\n0123456789\r\n";
+        assert!(parse_op(buf).is_err());
+    }
+
+    #[test]
+    fn parse_hmsg_hdr_len_too_small_rejected() {
+        let buf = b"HMSG subj 1 5 10\r\n0123456789\r\n";
+        assert!(parse_op(buf).is_err());
+    }
+
+    #[test]
+    fn parse_msg_exceeds_max_payload_rejected() {
+        let header = format!("MSG subj 1 {}\r\n", MAX_FRAME_PAYLOAD + 1);
+        assert!(parse_op(header.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn validate_kv_key_checks() {
+        assert!(validate_kv_key("users:101").is_ok());
+        assert!(validate_kv_key("a.b.c").is_ok());
+        assert!(validate_kv_key("foo/bar_baz-1=2").is_ok());
+        assert!(validate_kv_key("").is_err());
+        assert!(validate_kv_key(".leading").is_err());
+        assert!(validate_kv_key("trailing.").is_err());
+        assert!(validate_kv_key("double..dot").is_err());
+        assert!(validate_kv_key("wild*card").is_err());
+        assert!(validate_kv_key("wild>card").is_err());
+        assert!(validate_kv_key("with space").is_err());
+        assert!(validate_kv_key("with\r\ncrlf").is_err());
+    }
+
+    #[test]
+    fn validate_js_identifier_checks() {
+        assert!(validate_js_identifier("KV_my-bucket", "stream").is_ok());
+        assert!(validate_js_identifier("", "stream").is_err());
+        assert!(validate_js_identifier("has.dot", "stream").is_err());
+        assert!(validate_js_identifier("has*star", "consumer").is_err());
+        assert!(validate_js_identifier("has>gt", "consumer").is_err());
+        assert!(validate_js_identifier("has space", "consumer").is_err());
     }
 }

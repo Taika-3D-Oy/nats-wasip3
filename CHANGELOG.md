@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0-rc.2] – 2026-10-21
+
+### Security
+
+- **KV Key & Watch Pattern Validation**:
+  - Added strict validation for concrete KV keys (`validate_kv_key`) across `get`, `entry`, `put`, `create`, `update`, `delete`, `purge`, and `history` to reject empty keys, leading/trailing/consecutive dots, wildcards (`*`, `>`), whitespace, and control characters.
+  - Added `validate_kv_watch_pattern` for `keys_matching`, `watch`, `watch_with_history`, `watch_from_revision`, and `watch_many` to permit `*` and `>` wildcards while rejecting malformed dot sequences, whitespace, and control characters.
+- **JetStream Identifier Validation**:
+  - Added `validate_js_identifier` across stream, consumer, and object store NUID operations (`get_stream`, `delete_stream`, `purge_stream`, `purge_stream_subject`, `stream_get_msg`, `direct_get*`, `get_consumer`, `delete_consumer`, `consumer_names`, `list_consumers`, and `ObjectStore` chunk subjects) to prevent subject token injection.
+- **Protocol Frame & Header Hardening**:
+  - Enforced `MAX_FRAME_PAYLOAD` bounds, checked offset arithmetic, `hdr_len` range validation (`10 <= hdr_len <= total_len`), and trailing `\r\n` verification in `parse_msg` and `parse_hmsg`.
+  - Sanitized `\r`, `\n`, and `\0` in `Headers::encode_with_status` status text to prevent header smuggling.
+- **Object Store Hardening**:
+  - Added 128-bit CSPRNG entropy (`wasip3::random::random::get_random_bytes`) to `generate_chunk_subject_id` and reduced the initial read buffer preallocation cap from 64 MiB to 16 MiB.
+
 ## [1.0.0-rc.1] – 2026-09-23
 
 ### Added

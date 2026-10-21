@@ -144,13 +144,19 @@ impl KeyValue {
         })
     }
 
-    fn subject(&self, key: &str) -> String {
-        format!("{KV_SUBJECT_PREFIX}.{}.{key}", self.bucket)
+    fn subject(&self, key: &str) -> Result<String, Error> {
+        crate::proto::validate_kv_key(key)?;
+        Ok(format!("{KV_SUBJECT_PREFIX}.{}.{key}", self.bucket))
+    }
+
+    fn pattern_subject(&self, pattern: &str) -> Result<String, Error> {
+        crate::proto::validate_kv_watch_pattern(pattern)?;
+        Ok(format!("{KV_SUBJECT_PREFIX}.{}.{pattern}", self.bucket))
     }
 
     /// Get a key's value. Returns `None` if the key doesn't exist or is deleted.
     pub async fn get(&self, key: &str) -> Result<Option<Entry>, Error> {
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         // Use direct get for single-key lookups.
         let direct_subject = format!("$JS.API.DIRECT.GET.{}.{}", self.stream_name, subject);
         let reply = match self
@@ -210,7 +216,7 @@ impl KeyValue {
     /// Returns `None` only when the key has never existed.
     /// Mirrors `async_nats::jetstream::kv::Store::entry`.
     pub async fn entry(&self, key: &str) -> Result<Option<Entry>, Error> {
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         let direct_subject = format!("$JS.API.DIRECT.GET.{}.{}", self.stream_name, subject);
         let reply = match self
             .js
@@ -259,7 +265,7 @@ impl KeyValue {
 
     /// Put a value (unconditional write). Returns the revision.
     pub async fn put(&self, key: &str, value: &[u8]) -> Result<u64, Error> {
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         let ack = self.js.publish(&subject, value).await?;
         Ok(ack.seq)
     }
@@ -272,7 +278,7 @@ impl KeyValue {
     pub async fn put_with_ttl(&self, key: &str, value: &[u8], ttl: Duration) -> Result<u64, Error> {
         let mut headers = Headers::new();
         headers.insert("Nats-TTL", format_ttl(ttl));
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         let ack = self
             .js
             .publish_with_headers(&subject, &headers, value)
@@ -284,7 +290,7 @@ impl KeyValue {
     pub async fn create(&self, key: &str, value: &[u8]) -> Result<u64, Error> {
         let mut headers = Headers::new();
         headers.insert("Nats-Expected-Last-Subject-Sequence", "0");
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self
             .js
             .publish_with_headers(&subject, &headers, value)
@@ -307,7 +313,7 @@ impl KeyValue {
         let mut headers = Headers::new();
         headers.insert("Nats-Expected-Last-Subject-Sequence", "0");
         headers.insert("Nats-TTL", format_ttl(ttl));
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self
             .js
             .publish_with_headers(&subject, &headers, value)
@@ -331,7 +337,7 @@ impl KeyValue {
             "Nats-Expected-Last-Subject-Sequence",
             expected_revision.to_string(),
         );
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self
             .js
             .publish_with_headers(&subject, &headers, value)
@@ -358,7 +364,7 @@ impl KeyValue {
             expected_revision.to_string(),
         );
         headers.insert("Nats-TTL", format_ttl(ttl));
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self
             .js
             .publish_with_headers(&subject, &headers, value)
@@ -374,7 +380,7 @@ impl KeyValue {
     pub async fn delete(&self, key: &str) -> Result<(), Error> {
         let mut headers = Headers::new();
         headers.insert("KV-Operation", "DEL");
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         self.js
             .publish_with_headers(&subject, &headers, b"")
             .await?;
@@ -396,7 +402,7 @@ impl KeyValue {
             "Nats-Expected-Last-Subject-Sequence",
             expected_revision.to_string(),
         );
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self.js.publish_with_headers(&subject, &headers, b"").await {
             Ok(_) => Ok(()),
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
@@ -415,7 +421,7 @@ impl KeyValue {
         let mut headers = Headers::new();
         headers.insert("KV-Operation", "PURGE");
         headers.insert("Nats-Rollup", "sub");
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         self.js
             .publish_with_headers(&subject, &headers, b"")
             .await?;
@@ -429,7 +435,7 @@ impl KeyValue {
         headers.insert("KV-Operation", "PURGE");
         headers.insert("Nats-Rollup", "sub");
         headers.insert("Nats-TTL", format_ttl(ttl));
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         self.js
             .publish_with_headers(&subject, &headers, b"")
             .await?;
@@ -450,7 +456,7 @@ impl KeyValue {
             "Nats-Expected-Last-Subject-Sequence",
             expected_revision.to_string(),
         );
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self.js.publish_with_headers(&subject, &headers, b"").await {
             Ok(_) => Ok(()),
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
@@ -474,7 +480,7 @@ impl KeyValue {
             expected_revision.to_string(),
         );
         headers.insert("Nats-TTL", format_ttl(ttl));
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         match self.js.publish_with_headers(&subject, &headers, b"").await {
             Ok(_) => Ok(()),
             Err(Error::JetStream { code: 400, .. }) => Err(Error::RevisionMismatch),
@@ -493,13 +499,14 @@ impl KeyValue {
         key: &str,
         revision: u64,
     ) -> Result<Option<Entry>, Error> {
+        let expected_subject = self.subject(key)?;
         let msg = match self.js.stream_get_msg(&self.stream_name, revision).await? {
             Some(m) => m,
             None => return Ok(None),
         };
 
         // Confirm the message belongs to this key.
-        if msg.subject != self.subject(key) {
+        if msg.subject != expected_subject {
             return Ok(None);
         }
 
@@ -574,7 +581,7 @@ impl KeyValue {
 
     /// List all keys matching a specific wildcard pattern (e.g. `"users.*"` or `"orders.>"`) in the bucket.
     pub async fn keys_matching(&self, pattern: &str) -> Result<Vec<String>, Error> {
-        let subject = format!("{KV_SUBJECT_PREFIX}.{}.{pattern}", self.bucket);
+        let subject = self.pattern_subject(pattern)?;
         let consumer_cfg = ConsumerConfig {
             durable_name: None,
             filter_subject: Some(subject),
@@ -699,7 +706,7 @@ impl KeyValue {
     /// included in sequence order.
     /// Mirrors `async_nats::jetstream::kv::Store::history`.
     pub async fn history(&self, key: &str) -> Result<Vec<Entry>, Error> {
-        let subject = self.subject(key);
+        let subject = self.subject(key)?;
         let consumer_cfg = ConsumerConfig {
             durable_name: None,
             filter_subject: Some(subject),
@@ -812,7 +819,7 @@ impl KeyValue {
     /// filtered to the specific key subject.
     /// Mirrors `async_nats::jetstream::kv::Store::watch`.
     pub async fn watch(&self, key: impl AsRef<str>) -> Result<KvWatcher, Error> {
-        let subject = self.subject(key.as_ref());
+        let subject = self.pattern_subject(key.as_ref())?;
         self.create_watcher_subject(subject, DeliverPolicy::LastPerSubject, None)
             .await
     }
@@ -823,7 +830,7 @@ impl KeyValue {
     /// Requires `history > 1` on the bucket to see more than one revision.
     /// Mirrors `async_nats::jetstream::kv::Store::watch_with_history`.
     pub async fn watch_with_history(&self, key: impl AsRef<str>) -> Result<KvWatcher, Error> {
-        let subject = self.subject(key.as_ref());
+        let subject = self.pattern_subject(key.as_ref())?;
         self.create_watcher_subject(subject, DeliverPolicy::All, None)
             .await
     }
@@ -836,7 +843,7 @@ impl KeyValue {
         key: impl AsRef<str>,
         revision: u64,
     ) -> Result<KvWatcher, Error> {
-        let subject = self.subject(key.as_ref());
+        let subject = self.pattern_subject(key.as_ref())?;
         self.create_watcher_subject(subject, DeliverPolicy::ByStartSequence, Some(revision))
             .await
     }
@@ -975,10 +982,10 @@ impl KeyValue {
         T: AsRef<str>,
         K: IntoIterator<Item = T>,
     {
-        let filter_subjects = keys
-            .into_iter()
-            .map(|k| format!("{KV_SUBJECT_PREFIX}.{}.{}", self.bucket, k.as_ref()))
-            .collect::<Vec<_>>();
+        let mut filter_subjects = Vec::new();
+        for k in keys {
+            filter_subjects.push(self.pattern_subject(k.as_ref())?);
+        }
 
         if filter_subjects.is_empty() {
             return Err(Error::Protocol(

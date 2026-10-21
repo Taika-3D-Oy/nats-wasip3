@@ -98,18 +98,21 @@ impl JetStream {
 
     /// Create a stream.
     pub async fn create_stream(&self, config: &StreamConfig) -> Result<StreamInfo, Error> {
+        crate::proto::validate_js_identifier(&config.name, "stream name")?;
         self.api_request(&format!("STREAM.CREATE.{}", config.name), config)
             .await
     }
 
     /// Update an existing stream configuration.
     pub async fn update_stream(&self, config: &StreamConfig) -> Result<StreamInfo, Error> {
+        crate::proto::validate_js_identifier(&config.name, "stream name")?;
         self.api_request(&format!("STREAM.UPDATE.{}", config.name), config)
             .await
     }
 
     /// Delete a stream.
     pub async fn delete_stream(&self, name: &str) -> Result<bool, Error> {
+        crate::proto::validate_js_identifier(name, "stream name")?;
         let resp: DeleteResponse = self
             .api_request_empty(&format!("STREAM.DELETE.{name}"))
             .await?;
@@ -118,6 +121,7 @@ impl JetStream {
 
     /// Get stream info.
     pub async fn stream_info(&self, name: &str) -> Result<StreamInfo, Error> {
+        crate::proto::validate_js_identifier(name, "stream name")?;
         self.api_request_empty(&format!("STREAM.INFO.{name}")).await
     }
 
@@ -217,6 +221,7 @@ impl JetStream {
 
     /// Purge all messages from a stream.
     pub async fn purge_stream(&self, name: &str) -> Result<PurgeResponse, Error> {
+        crate::proto::validate_js_identifier(name, "stream name")?;
         self.api_request_empty(&format!("STREAM.PURGE.{name}"))
             .await
     }
@@ -227,6 +232,7 @@ impl JetStream {
         name: &str,
         subject: &str,
     ) -> Result<PurgeResponse, Error> {
+        crate::proto::validate_js_identifier(name, "stream name")?;
         #[derive(Serialize)]
         struct PurgeReq<'a> {
             filter: &'a str,
@@ -271,8 +277,12 @@ impl JetStream {
         stream: &str,
         config: &ConsumerConfig,
     ) -> Result<ConsumerInfo, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
         let op = match &config.durable_name {
-            Some(name) => format!("CONSUMER.CREATE.{stream}.{name}"),
+            Some(name) => {
+                crate::proto::validate_js_identifier(name, "consumer name")?;
+                format!("CONSUMER.CREATE.{stream}.{name}")
+            }
             None => format!("CONSUMER.CREATE.{stream}"),
         };
         #[derive(Serialize)]
@@ -292,6 +302,8 @@ impl JetStream {
 
     /// Delete a consumer.
     pub async fn delete_consumer(&self, stream: &str, consumer: &str) -> Result<bool, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
+        crate::proto::validate_js_identifier(consumer, "consumer name")?;
         let resp: DeleteResponse = self
             .api_request_empty(&format!("CONSUMER.DELETE.{stream}.{consumer}"))
             .await?;
@@ -300,6 +312,7 @@ impl JetStream {
 
     /// Return the names of all consumers on a stream.
     pub async fn consumer_names(&self, stream: &str) -> Result<Vec<String>, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
         #[derive(Serialize)]
         struct ConsumerNamesReq {
             offset: usize,
@@ -336,6 +349,7 @@ impl JetStream {
 
     /// List all consumers and their state on a stream.
     pub async fn list_consumers(&self, stream: &str) -> Result<Vec<ConsumerInfo>, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
         #[derive(Serialize)]
         struct ConsumerListReq {
             offset: usize,
@@ -378,6 +392,9 @@ impl JetStream {
         batch: u32,
     ) -> Result<Vec<Message>, Error> {
         use crate::client::with_timeout;
+
+        crate::proto::validate_js_identifier(stream, "stream name")?;
+        crate::proto::validate_js_identifier(consumer, "consumer name")?;
 
         #[derive(Serialize)]
         struct FetchReq {
@@ -446,6 +463,7 @@ impl JetStream {
         stream: &str,
         seq: u64,
     ) -> Result<Option<StreamMessage>, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
         #[derive(Serialize)]
         struct GetReq {
             seq: u64,
@@ -516,6 +534,8 @@ impl JetStream {
         stream: &str,
         subject: &str,
     ) -> Result<Option<DirectMessage>, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
+        crate::proto::validate_kv_key(subject)?;
         let direct_subject = format!("{}.DIRECT.GET.{stream}.{subject}", self.prefix);
         let reply = match self
             .client
@@ -558,6 +578,7 @@ impl JetStream {
     /// Get a message by stream sequence number directly using `$JS.API.DIRECT.GET.<stream>`.
     /// Requires `allow_direct: true` on the stream.
     pub async fn direct_get(&self, stream: &str, seq: u64) -> Result<Option<DirectMessage>, Error> {
+        crate::proto::validate_js_identifier(stream, "stream name")?;
         #[derive(Serialize)]
         struct DirectReq {
             seq: u64,
@@ -1426,7 +1447,8 @@ mod tests {
 
     #[test]
     fn test_stream_names_response_deserialization() {
-        let json = r#"{"total": 2, "offset": 0, "limit": 1024, "streams": ["STREAM_A", "STREAM_B"]}"#;
+        let json =
+            r#"{"total": 2, "offset": 0, "limit": 1024, "streams": ["STREAM_A", "STREAM_B"]}"#;
         #[derive(Deserialize)]
         struct StreamNamesResp {
             #[serde(default)]

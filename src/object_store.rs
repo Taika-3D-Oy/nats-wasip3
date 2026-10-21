@@ -239,6 +239,8 @@ impl ObjectStore {
             )));
         }
 
+        crate::proto::validate_js_identifier(&meta.nuid, "object nuid")?;
+
         let consumer_cfg = ConsumerConfig {
             durable_name: None,
             filter_subject: Some(self.chunk_subject(&meta.nuid)),
@@ -264,7 +266,7 @@ impl ObjectStore {
         let del = format!("$JS.API.CONSUMER.DELETE.{}.{}", self.stream_name, info.name);
         let _ = self.js.client().publish_with_reply(&del, &inbox, b"");
 
-        let initial_cap = (meta.size as usize).min(64 * 1024 * 1024);
+        let initial_cap = (meta.size as usize).min(16 * 1024 * 1024);
         let mut out = Vec::with_capacity(initial_cap);
         for msg in msgs {
             out.extend_from_slice(&msg.payload);
@@ -338,6 +340,8 @@ impl ObjectStore {
         let Some(meta) = self.get_meta(name).await? else {
             return Ok(false);
         };
+
+        crate::proto::validate_js_identifier(&meta.nuid, "object nuid")?;
 
         let _ = self
             .js
@@ -614,7 +618,34 @@ fn compute_digest(data: &[u8]) -> String {
 fn generate_chunk_subject_id() -> Result<String, Error> {
     let now = now_unix_nanos();
     let id = NEXT_CHUNK_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(format!("O{now:032x}{id:016x}"))
+    let rand_hex = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let bytes = wasip3::random::random::get_random_bytes(16);
+            let mut s = String::with_capacity(32);
+            for b in bytes {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut hasher = Sha256::new();
+            hasher.update(now.to_le_bytes());
+            hasher.update(id.to_le_bytes());
+            let stack_addr = &id as *const u64 as usize;
+            hasher.update(stack_addr.to_le_bytes());
+            let digest = hasher.finalize();
+            let mut s = String::with_capacity(32);
+            for b in &digest[..16] {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        }
+    };
+    Ok(format!("O{now:032x}{id:016x}{rand_hex}"))
 }
 
 fn name_to_subject_token(name: &str) -> String {

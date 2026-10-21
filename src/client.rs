@@ -1522,7 +1522,7 @@ async fn attempt_reconnect(
                     ServerOp::Ok => {}
                     ServerOp::Info(new_info) => {
                         // Server may resend INFO after TLS upgrade.
-                        if !new_info.connect_urls.is_empty() {
+                        if config.allow_advertised_servers && !new_info.connect_urls.is_empty() {
                             inner.borrow_mut().known_servers = new_info.connect_urls;
                         }
                     }
@@ -2135,37 +2135,31 @@ mod tests {
         // Call drain
         sub.drain();
         // Server UNSUB must be queued
-        assert!(inner.borrow().write_buf.starts_with(b"UNSUB sub_drain_1\r\n"));
+        assert!(inner
+            .borrow()
+            .write_buf
+            .starts_with(b"UNSUB sub_drain_1\r\n"));
         // SubInfo is removed so it won't resubscribe on reconnect
         assert!(!inner.borrow().subscriptions.contains_key(sid));
         // Mailbox still exists because 2 messages are buffered
         assert!(inner.borrow().mailboxes.contains_key(sid));
 
         // Poll first message
-        let mut next1 = NextMessage {
-            sid,
-            inner: &inner,
-        };
+        let mut next1 = NextMessage { sid, inner: &inner };
         match Pin::new(&mut next1).poll(&mut cx) {
             Poll::Ready(Ok(m)) => assert_eq!(m.payload, b"msg1"),
             other => panic!("expected Ready(Ok(msg1)), got {other:?}"),
         }
 
         // Poll second message
-        let mut next2 = NextMessage {
-            sid,
-            inner: &inner,
-        };
+        let mut next2 = NextMessage { sid, inner: &inner };
         match Pin::new(&mut next2).poll(&mut cx) {
             Poll::Ready(Ok(m)) => assert_eq!(m.payload, b"msg2"),
             other => panic!("expected Ready(Ok(msg2)), got {other:?}"),
         }
 
         // Poll third time: queue is now empty and draining -> Disconnected
-        let mut next3 = NextMessage {
-            sid,
-            inner: &inner,
-        };
+        let mut next3 = NextMessage { sid, inner: &inner };
         match Pin::new(&mut next3).poll(&mut cx) {
             Poll::Ready(Err(Error::Disconnected)) => {}
             other => panic!("expected Ready(Err(Disconnected)), got {other:?}"),
