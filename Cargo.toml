@@ -2,15 +2,14 @@
 
 [package]
 name = "nats-wasip3"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2021"
 description = "NATS client for wasm32-wasip3 — native Component Model async I/O"
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/Taika-3D-Oy/nats-wasip3"
 keywords = ["nats", "wasi", "wasip3", "wasm", "jetstream"]
 categories = ["network-programming", "wasm"]
-authors = ["Taika 3D Oy"]
+authors = ["nats-wasip3 Contributors"]
 rust-version = "1.85"
 
 [package.metadata.docs.rs]

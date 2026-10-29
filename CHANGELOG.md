@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0-rc.4] – 2026-10-29
+
+### Changed
+
+- **Package Metadata & Licensing**:
+  - Updated package authorship and license copyright attribution to `nats-wasip3 Contributors`.
+
 ## [1.0.0-rc.3] – 2026-10-29
 
 ### Added
