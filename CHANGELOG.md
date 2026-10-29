@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0-rc.3] – 2026-10-29
+
+### Added
+
+- **JetStream & KV Delete Marker TTL (`subject_delete_marker_ttl` / `limit_markers`)**:
+  - Added `subject_delete_marker_ttl: Option<u64>` to `jetstream::StreamConfig` for configuring server-side TTL (in nanoseconds) on subject delete and purge markers when `allow_msg_ttl` is enabled (NATS server 2.11+).
+  - Added `limit_markers: Option<Duration>` to `kv::KvConfig` and wired it to `StreamConfig::subject_delete_marker_ttl` during `KeyValue::new` bucket creation so deleted key tombstones can be automatically reaped by JetStream.
+
 ## [1.0.0-rc.2] – 2026-10-21
 
 ### Security

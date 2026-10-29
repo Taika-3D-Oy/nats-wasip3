@@ -78,6 +78,10 @@ pub struct KvConfig {
     /// Allow per-message TTL via [`KeyValue::put_with_ttl`] etc.
     /// Requires NATS server 2.11+.
     pub allow_msg_ttl: bool,
+    /// Optional server-side TTL (in nanoseconds) for delete and purge tombstone
+    /// markers so deleted keys are automatically reaped by JetStream (requires
+    /// `allow_msg_ttl: true`, NATS server 2.11+).
+    pub limit_markers: Option<Duration>,
     pub storage: Storage,
     pub num_replicas: u32,
 }
@@ -91,6 +95,7 @@ impl Default for KvConfig {
             max_bytes: -1,
             ttl: None,
             allow_msg_ttl: false,
+            limit_markers: None,
             storage: Storage::File,
             num_replicas: 1,
         }
@@ -120,6 +125,7 @@ impl KeyValue {
             allow_direct: true,
             allow_rollup_hdrs: true,
             allow_msg_ttl: config.allow_msg_ttl,
+            subject_delete_marker_ttl: config.limit_markers,
             ..Default::default()
         };
 

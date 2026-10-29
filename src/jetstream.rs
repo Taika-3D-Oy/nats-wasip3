@@ -885,6 +885,10 @@ pub struct StreamConfig {
     /// Allow per-message TTL via the `Nats-TTL` header (NATS server 2.11+).
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_msg_ttl: bool,
+    /// Server-side TTL (in nanoseconds) for subject delete/purge markers when
+    /// `allow_msg_ttl` is enabled (NATS server 2.11+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_delete_marker_ttl: Option<u64>,
     /// Enable server-side message scheduling via `Nats-Schedule` headers
     /// (NATS server 2.14+). When `true`, publishing a message with a
     /// `Nats-Schedule` header causes the server to repeatedly re-publish it
